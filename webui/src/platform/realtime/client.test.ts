@@ -50,20 +50,6 @@ describe("StudentSocket", () => {
     const frames = instance.sent.map((value) => JSON.parse(value) as { type: string; v: string; payload: Record<string, unknown> });
     expect(frames[0]).toMatchObject({ v: "1", type: "session.subscribe", payload: { session_id: "session_1" } });
     expect(frames[1]).toMatchObject({ v: "1", type: "chat.send", payload: { session_id: "session_1", content: "hello", idempotency_key: "request_1", model_profile: "qwen", thinking_enabled: false, learning_context: { topic: "Transformer", level: "intermediate", mode: "practice" }, knowledge_book_context: { knowledge_point_id: "point-1", selected_text: "词元" } } });
-    }, "qwen", undefined, false, {
-      workspace_id: "workspace-1",
-      topic_id: "topic-1",
-      topic_name: "基础",
-      knowledge_point_id: "point-1",
-      title: "词法分析",
-      heading: "核心概念",
-      selected_text: "词元",
-      content_markdown: "## 核心概念\n\n词元",
-    });
-
-    const frames = instance.sent.map((value) => JSON.parse(value) as { type: string; v: string; payload: Record<string, unknown> });
-    expect(frames[0]).toMatchObject({ v: "1", type: "session.subscribe", payload: { session_id: "session_1" } });
-    expect(frames[1]).toMatchObject({ v: "1", type: "chat.send", payload: { session_id: "session_1", content: "hello", idempotency_key: "request_1", model_profile: "qwen", thinking_enabled: false, learning_context: { topic: "Transformer", level: "intermediate", mode: "practice" }, knowledge_book_context: { knowledge_point_id: "point-1", selected_text: "词元" } } });
     client.close();
   });
 

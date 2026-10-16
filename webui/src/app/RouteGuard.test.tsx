@@ -21,6 +21,8 @@ describe("RouteGuard", () => {
       refreshSession: vi.fn(),
       logout: vi.fn(),
       error: "",
+      authNotice: "",
+      clearAuthNotice: vi.fn(),
     });
 
     render(<MemoryRouter initialEntries={["/teacher/exercises"]}>
