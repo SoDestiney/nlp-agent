@@ -91,6 +91,7 @@ async function request<T>(
 ): Promise<T> {
   const requestGeneration = authGeneration;
   const requestCsrfToken = csrfToken;
+  const requestStartedDuringAuthMutation = authMutation !== null;
   const method = (init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) {
@@ -132,6 +133,7 @@ async function request<T>(
     }
     const currentAuthFailure = response.status === 401 &&
       requestGeneration === authGeneration &&
+      !requestStartedDuringAuthMutation &&
       !authMutation &&
       !path.startsWith("/auth/login") &&
       !options.ignoreAuthExpired &&

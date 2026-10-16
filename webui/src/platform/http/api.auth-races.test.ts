@@ -38,6 +38,31 @@ describe("authentication response ownership", () => {
     }
   });
 
+  it("ignores a 401 from a request started during login after the new session is established", async () => {
+    const client = await import("./api");
+    const login = deferred();
+    const duringLogin = deferred();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockReturnValueOnce(login.promise)
+      .mockReturnValueOnce(duringLogin.promise).mockResolvedValueOnce(reply({ session_id: "created" }));
+    const authRequired = vi.fn();
+    window.addEventListener(client.AUTH_REQUIRED_EVENT, authRequired);
+    try {
+      const pendingLogin = client.api.login("new", "fixture-password");
+      const pendingRequest = client.api.listSessions().catch((error) => error.status);
+
+      login.resolve(reply(session("new")));
+      await pendingLogin;
+      duringLogin.resolve(reply({ code: "authentication_required" }, 401));
+      expect(await pendingRequest).toBe(401);
+
+      await client.api.createSession();
+      expect(new Headers(fetchMock.mock.calls[2][1]?.headers).get("X-CSRF-Token")).toBe("csrf-new");
+      expect(authRequired).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(client.AUTH_REQUIRED_EVENT, authRequired);
+    }
+  });
+
   it("rejects a delayed old session restore instead of overwriting a new login", async () => {
     const client = await import("./api");
     const old = deferred();
