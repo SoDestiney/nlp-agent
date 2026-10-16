@@ -53,6 +53,23 @@ describe("StudentSocket", () => {
     client.close();
   });
 
+  it("refreshes the HTTP auth session after every protocol-level reconnect", async () => {
+    const instances: FakeWebSocket[] = [];
+    const refreshSession = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("WebSocket", class extends FakeWebSocket {
+      constructor(url: string) { super(url); instances.push(this); }
+    });
+    const client = new StudentSocket(vi.fn(), vi.fn(), async () => "test-ticket", refreshSession);
+    client.setSession("session_1");
+    await Promise.resolve();
+    instances[0].open();
+    instances[0].onmessage?.({ data: JSON.stringify({ v: "1", type: "connection.ready", timestamp: new Date().toISOString(), payload: {} }) });
+
+    await Promise.resolve();
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+
   it("subscribes to a newly created session when randomUUID is unavailable over HTTP", async () => {
     const instances: FakeWebSocket[] = [];
     vi.stubGlobal("crypto", {

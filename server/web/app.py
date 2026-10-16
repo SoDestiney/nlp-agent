@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyCookie
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -41,6 +42,7 @@ from gateway.core import BackendGateway
 from server.infrastructure.mysql.models import ClassroomModel
 from server.web.auth import (
     AuthenticationError,
+    AuthorizationChangedError,
     CsrfRejectedError,
     LoginRateLimitError,
     OriginRejectedError,
@@ -178,14 +180,17 @@ from server.web.feedback import (
 from server.auth.dependencies import get_db_session
 from server.auth import code_store
 from server.auth.captcha import generate_captcha_image
-from server.user.schemas import EmailCodeRequest, UserRegister
+from server.classroom_join.service import ClassJoinError
+from server.user.schemas import EmailCodeRequest, SmsCodeRequest, UserRegister
 from server.user.service import (
     EmailAlreadyUsedError,
     InvalidCaptchaError,
     InvalidEmailCodeError,
+    InvalidSmsCodeError,
     UserAlreadyExistsError,
     UserService,
     generate_email_code,
+    generate_sms_code,
 )
 from server.user.email_provider import (
     EmailConfigurationError,
@@ -194,6 +199,7 @@ from server.user.email_provider import (
     mask_email_for_logging,
 )
 from server.user.email import InvalidEmailError, normalize_email
+from server.user.tencent_sms import create_tencent_sms_provider_from_env
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 
@@ -203,6 +209,25 @@ GatewayFactory = Callable[[], BackendGateway]
 # Strong references to in-flight authorization-audit flush tasks so the
 # deferred writes survive garbage collection until they finish.
 _pending_audit_tasks: set[asyncio.Task] = set()
+
+
+def _is_registration_unique_conflict(error: IntegrityError) -> bool:
+    """Return True only for identity uniqueness conflicts during registration."""
+    original = getattr(error, "orig", None)
+    text = str(original if original is not None else error).casefold()
+    is_unique_violation = "duplicate" in text or "unique constraint" in text
+    return is_unique_violation and any(
+        marker in text
+        for marker in (
+            "uq_nlp_users_phone_number",
+            "uq_nlp_users_phone_number_normalized",
+            "uq_nlp_users_username_lower",
+            "key 'phone_number'",
+            "key 'phone_number_normalized'",
+            "key 'username_lower'",
+            "email_normalized",
+        )
+    )
 
 
 class SpaStaticFiles(StaticFiles):
@@ -885,13 +910,43 @@ def create_app(
         response.headers["Retry-After"] = str(error.retry_after_s)
         return response
 
-    @app.exception_handler(AuthenticationError)
-    async def authentication_error(request: Request, _error: AuthenticationError):
+    @app.exception_handler(AuthorizationChangedError)
+    async def authorization_changed_error(request: Request, _error: AuthorizationChangedError):
         return _problem(
             request,
             status_code=status.HTTP_401_UNAUTHORIZED,
-            code="authentication_required",
+            code="authorization_changed",
+            title="Authorization changed",
+            detail="账号权限已更新，请重新登录",
+        )
+
+    @app.exception_handler(AuthenticationError)
+    async def authentication_error(request: Request, error: AuthenticationError):
+        if request.url.path.rstrip("/").endswith("/auth/login"):
+            code = "authentication_required"
+            detail = "手机号或密码错误"
+        elif str(error) == "authentication cookie has expired":
+            code = "session_expired"
+            detail = "登录已过期，请重新登录"
+        else:
+            code = "authentication_required"
+            detail = None
+        return _problem(
+            request,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code=code,
             title="Authentication required",
+            detail=detail,
+        )
+
+    @app.exception_handler(ClassJoinError)
+    async def classroom_join_error(request: Request, error: ClassJoinError):
+        return _problem(
+            request,
+            status_code=error.status_code,
+            code=error.code,
+            title="Classroom join request failed",
+            detail=error.detail,
         )
 
     @app.exception_handler(OriginRejectedError)
@@ -1073,6 +1128,44 @@ def create_app(
                 "expires_in": code_store.EMAIL_CODE_TTL_S,
                 "resend_after": code_store.EMAIL_RESEND_COOLDOWN_S}
 
+    @app.post("/api/v1/auth/sms/send", status_code=status.HTTP_200_OK, tags=["auth"])
+    async def send_sms_code(body: SmsCodeRequest, db: DbSession, request: Request):
+        """Validate a CAPTCHA and issue a short-lived SMS verification code."""
+        await code_store.purge_expired(db)
+        if not await code_store.consume_code(
+            db, kind="captcha", subject=body.captcha_id, code=body.captcha_code
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired CAPTCHA",
+            )
+        phone = body.phone_number.strip()
+        client_ip = request.client.host if request.client else None
+        allowed, reason = await code_store.sms_send_allowed(
+            db, phone=phone, client_ip=client_ip
+        )
+        if not allowed:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=reason)
+        code = generate_sms_code()
+        provider = create_tencent_sms_provider_from_env()
+        if provider is not None:
+            if not await provider.send_verification_code(phone, code):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="SMS gateway failed to deliver the code",
+                )
+        else:
+            logger.warning("[SMS] Development verification code for %s: %s", phone, code)
+        await code_store.put_code(
+            db,
+            kind="sms",
+            subject=phone,
+            code=code,
+            ttl_s=code_store.SMS_CODE_TTL_S,
+            client_ip=client_ip,
+        )
+        return {"message": "SMS code sent successfully"}
+
     @app.post("/api/v1/auth/login", status_code=status.HTTP_200_OK, tags=["auth"])
     async def login(body: LoginBody, request: Request, response: Response):
         factory = getattr(request.app.state.gateway, "authorization_session_factory", None)
@@ -1156,15 +1249,20 @@ def create_app(
 
     @app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED, tags=["auth"])
     async def register_user(body: UserRegister, db: DbSession):
-        """Register an email account through the unified user service."""
+        """Register a verified phone or email account without creating a session."""
         service = UserService(db)
         try:
             user = await service.register_user(body)
+            roles = await service.get_roles_for_users([user.id])
         except InvalidCaptchaError as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
             ) from error
         except InvalidEmailCodeError as error:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
+            ) from error
+        except InvalidSmsCodeError as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
             ) from error
@@ -1174,11 +1272,22 @@ def create_app(
             ) from error
         except InvalidEmailError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
+        except IntegrityError as error:
+            # Identity lookups improve the message; the database unique keys
+            # remain authoritative when registrations race.
+            await db.rollback()
+            if _is_registration_unique_conflict(error):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This registration identity is already in use",
+                ) from error
+            raise
         return {
             "message": "User registered successfully",
             "user_id": user.id,
             "username": user.username,
             "display_name": user.display_name,
+            "roles": roles.get(user.id, []),
         }
 
     @app.post("/api/v1/auth/guest", status_code=status.HTTP_200_OK, tags=["auth"])
@@ -2351,7 +2460,7 @@ def create_app(
         async with authorization_session_factory(request)() as session:
             async with session.begin():
                 row = await rbac_service.create_classroom(session, workspace_id=body.workspace_id, name=body.name, actor_user_id=principal.user_id)
-        return {"id": row.id, "workspace_id": row.workspace_id, "name": row.name, "status": row.status}
+        return {"id": row.id, "workspace_id": row.workspace_id, "name": row.name, "join_code": row.join_code, "status": row.status}
 
     @app.put("/api/v1/classrooms/{classroom_id}/members/{user_id}", tags=["rbac"])
     async def replace_classroom_member(classroom_id: str, user_id: str, body: ReplaceClassroomMemberBody, request: Request, principal: Principal, _claims: WriteClaims):

@@ -1,4 +1,4 @@
-import { api, AUTH_EXPIRED_EVENT, ensureAuth, uploadAttachment } from "./api";
+import { api, AUTH_EXPIRED_EVENT, AUTH_REQUIRED_EVENT, ensureAuth, uploadAttachment } from "./api";
 
 describe("FastAPI client", () => {
   it("deduplicates concurrent authentication restores", async () => {
@@ -160,7 +160,9 @@ it("dispatches auth-expired only once when concurrent requests return 401", asyn
       }), { status: 401, headers: { "Content-Type": "application/json" } }));
 
     const onAuthExpired = vi.fn();
+    const onAuthRequired = vi.fn();
     window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
 
     try {
       await ensureAuth();
@@ -170,8 +172,10 @@ it("dispatches auth-expired only once when concurrent requests return 401", asyn
       });
 
       expect(onAuthExpired).not.toHaveBeenCalled();
+      expect(onAuthRequired).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+      window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
       fetchMock.mockRestore();
     }
   });

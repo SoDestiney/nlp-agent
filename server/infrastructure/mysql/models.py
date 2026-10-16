@@ -43,6 +43,11 @@ class UserModel(TimestampedModel, Base):
         # 生成列（见下方定义），保证 "Alice" 与 "alice" 在数据库层视为重复，
         # 杜绝同户名大小写不同的重复账号。
         Index("uq_nlp_users_username_lower", "username_lower", unique=True),
+        UniqueConstraint(
+            "phone_number_normalized", name="uq_nlp_users_phone_number_normalized"
+        ),
+        Index("ix_nlp_users_phone_number", "phone_number"),
+        Index("ix_nlp_users_phone_number_normalized", "phone_number_normalized"),
     )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
@@ -73,6 +78,8 @@ class UserModel(TimestampedModel, Base):
     email_normalized: Mapped[str | None] = mapped_column(
         String(254), nullable=True, unique=True, index=True
     )
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_number_normalized: Mapped[str | None] = mapped_column(String(16), nullable=True)
     registration_source: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="manual"
     )
@@ -248,12 +255,16 @@ class AuthorizationAuditLogModel(Base):
 
 class ClassroomModel(TimestampedModel, Base):
     __tablename__ = "nlp_classrooms"
+    __table_args__ = (
+        UniqueConstraint("join_code", name="uq_nlp_classrooms_join_code"),
+    )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
     workspace_id: Mapped[str] = mapped_column(
         UUID, ForeignKey("nlp_workspaces.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    join_code: Mapped[str] = mapped_column(String(12), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
 
 
@@ -1084,8 +1095,10 @@ class ClassJoinRequestModel(TimestampedModel, Base):
     __tablename__ = "nlp_class_join_requests"
     __table_args__ = (
         Index("ix_nlp_class_join_requests_class_status", "class_id", "status"),
-        # 防重复申请：同一 (班级, 用户, 状态) 只能有一条 pending
-        UniqueConstraint("class_id", "user_id", "status", name="uq_nlp_class_join_requests_cls_usr_sts"),
+        # MySQL has no partial unique index.  ``pending_key`` is populated only
+        # while a request is pending, so historical approved/rejected rows can
+        # coexist while concurrent pending submissions still have one winner.
+        Index("uq_nlp_class_join_requests_pending_key", "pending_key", unique=True),
     )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
@@ -1094,6 +1107,9 @@ class ClassJoinRequestModel(TimestampedModel, Base):
     )
     user_id: Mapped[str] = mapped_column(
         UUID, ForeignKey("nlp_users.id", ondelete="CASCADE"), nullable=False, comment="申请人"
+    )
+    pending_key: Mapped[str | None] = mapped_column(
+        String(73, collation="ascii_bin"), nullable=True, comment="仅 pending 状态使用的并发唯一键"
     )
     student_number: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="学生选填学号")
     status: Mapped[str] = mapped_column(

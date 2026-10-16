@@ -805,7 +805,21 @@ async def _receive_commands(
             except AuthenticationError:
                 await connection.close(code=4401, reason="authentication expired")
                 return
-            except (json.JSONDecodeError, ValidationError, ValueError, PermissionError, RuntimeError, LookupError, FileNotFoundError, StorageQuotaExceeded, QuotaRejectedError) as error:
+            except PermissionError as error:
+                if str(error) == "authorization changed; reconnect required":
+                    await connection.close(code=4403, reason="authorization changed")
+                    return
+                code, message, details = _command_error(error)
+                session_id = command.payload.get("session_id") if command is not None else None
+                await connection.send(
+                    control_event(
+                        "command.error",
+                        request_id=request_id,
+                        session_id=session_id if isinstance(session_id, str) else None,
+                        payload={"code": code, "message": message},
+                    )
+                )
+            except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError, LookupError, FileNotFoundError, StorageQuotaExceeded, QuotaRejectedError) as error:
                 code, message, details = _command_error(error)
                 session_id = command.payload.get("session_id") if command is not None else None
                 await connection.send(
