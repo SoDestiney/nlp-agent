@@ -2,6 +2,63 @@
 
 日期：2026-10-16。状态：六项复审 P1 已修复；T07 整体验收未完成，不可据此部署。
 
+## 后续推进：WebSocket 取消与真实基线
+
+### 已修复并复测
+
+此前偶发 `concurrent.futures.CancelledError` 已通过连续 WebSocket 连接/订阅失败/ping/断开复现。
+根因是 transport 的 AnyIO level cancellation 可以打断连接清理；原实现先设置 `_closed`，
+随后取消导致清理只完成一部分，再次 close 又因 `_closed` 提前返回。
+
+修复采用连接自有的单一 `_close_task`；并发 close 共同等待该任务，调用者取消不取消清理。
+端点在 accept、ready、receive 全阶段共用 finally，并用 AnyIO shield 保护清理。
+`wait_closed()` 在资源清理完毕后通知。这里只吸收 ASGI 连接的取消，不吞掉 Turn/Worker 的取消。
+
+回归 `tests/test_t07_websocket_shutdown.py`：
+
+- 连续 100 次真实 TestClient WebSocket 订阅不存在会话、ping 后断开；修改前复现 CancelledError，修改后通过。
+- 清理进行中取消调用者，第二次 close 必须等待原清理完成，且调用者仍收到取消。
+- accept 阶段取消必须释放 Hub 名额；该测试也先复现失败再修复。
+
+与既有 T07 定向回归合跑：**132 passed, 3 deselected**，三个明确排除项仍为真实 MySQL foundation 测试。
+另执行 `pytest tests/test_web_api.py -q --tb=line`：**23 passed, 2 failed**。
+失败分别为已确认旧问题 `test_learning_release_notes_route_requests_only_published`
+（mock factory 缺 begin），及 `test_http_lifecycle_sessions_chat_settings_and_csrf`
+（本次占位 DSN 无真实数据库，删除会话时观测库清理返回 503）。没有跳过它们或改断言。
+本次尚未重跑真实 HTTP/MySQL、迁移与完整后端门禁；上文历史结果不可冒充本次结果。
+独立只读审查未发现该限定修复的 P1/P2；未审查未验证的 Admission/负载草稿。
+
+### 基线尝试与新环境阻塞
+
+已准备隔离负载启动草稿 `tests/load/run_isolated.py`、真实 Worker/模型 entrypoint，
+以及 Admission 并发/事务/429 回归草稿。它们**尚未完成真实验证，也没有 Admission 数据库实现**，
+不属于已完成交付。冻结工作区仅复制 tests 工具；旧产品 core/gateway/server/configs/migrations 未修改。
+
+冻结旧版本启动命令：
+
+```powershell
+python -m tests.load.run_isolated --run-kind baseline --output artifacts/load-tests/t07/baseline.json --concurrency 1 --replicas 1
+```
+
+该命令在 Docker 前置检查失败，没有进入 50/30 负载，因此没有生成 baseline/final/comparison。
+当前 Docker Desktop 4.85.0 启动日志明确报告：
+
+```text
+starting services: initializing Inference manager:
+listening on unix://C:/Users/桂林/AppData/Local/Docker/run/dockerInference:
+The file cannot be accessed by the system.
+```
+
+`dockerInference` 是零长度 ReparsePoint；WSL `docker-desktop` 为 Stopped，
+Docker API 无法响应。已尝试正常启动和 `docker desktop stop --timeout 20` 后重启，
+正常停止也失败。未删除/重命名该运行时节点，未修改 Docker 全局设置，未工厂重置或清理卷。
+已申请隔离权限尝试把该零长度节点重命名为备份，但系统返回“系统无法访问此文件”，没有发生文件变更；
+未进一步删除 reparse point、重置 WSL 或修改 Docker Model Runner 全局设置。
+本次真实 Admission 测试为 **3 个 setup errors（Docker info 超时）**，不是测试通过，也没有证明实现行为。
+
+继续真实基线前需恢复 Docker 引擎；涉及运行目录节点或全局配置的修复需用户确认。
+Compose 保持 1×1。容量/额度账本/后台生命周期/监控及扩容验收仍按下文未完成清单执行。
+
 ## 隔离范围
 
 - 实施分支：`codex/t07-reliability-fixes`。
