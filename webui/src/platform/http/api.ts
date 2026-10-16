@@ -1,8 +1,9 @@
 import type { AuthSession, AuthorizationAuditListResponse, AuthorizationAuditSummary, ClassroomCreatedResponse, ClassroomJoinCodeResponse, ClassroomSummary, DeveloperRuntimeHealth, DeveloperSnapshot, FeedbackCategory, FeedbackDailyState, FeedbackPriority, FeedbackStatus, FeedbackThread, FeedbackThreadList, JoinRequest, JoinRequestListResponse, LearningBookNavigationItem, LearningBookPage, QuotaAdjustment, QuotaAlert, QuotaArchiveBatch, QuotaBillingRecord, QuotaBillingStatementInput, QuotaBinding, QuotaBucketCandidate, QuotaBucketReplay, QuotaCreditOperation, QuotaCreditOperationInput, QuotaDailyRollup, QuotaGrant, QuotaPolicy, QuotaPolicyExplanation, QuotaPolicyUpdateInput, QuotaPricingRule, QuotaRoleCreditOperationInput, QuotaRoleCreditOperationResult, QuotaSnapshot, QuotaUsageSnapshot, RbacPermission, RbacRole, ReleaseNoteEntry, SessionListResponse, SettingsRuntime, SystemMenu, TeacherAIAnalysisResult, TeacherBookArchiveImportPreview, TeacherBookAssetInput, TeacherBookFile, TeacherBookImportPreview, TeacherBookNavigationItem, TeacherBookPage, TeacherCatalog, TeacherOverview, TeacherAnalysisAnnotations, TeachingGoals, SessionSummary, TurnRecord, UserSettings, UserListResponse, UserProfile, WhiteboardLibraryItem, Workspace, WorkspaceMember } from "@/shared/types";
+import { AUTH_EXPIRED_EVENT, AUTH_REQUIRED_EVENT } from "@/platform/auth/auth-events";
+
+export { AUTH_EXPIRED_EVENT, AUTH_REQUIRED_EVENT } from "@/platform/auth/auth-events";
 
 const API_ROOT = "/api/v1";
-export const AUTH_EXPIRED_EVENT = "nova:auth-expired";
-export const AUTH_REQUIRED_EVENT = "nlp-auth-required";
 
 export interface AuthRequiredEventDetail {
   code: string;
@@ -129,23 +130,23 @@ async function request<T>(
       if (requestGeneration !== authGeneration) throw new AuthStateChangedError();
       return request<T>(path, init, false, options);
     }
-    if (
-      response.status === 401 &&
-      requestCsrfToken &&
+    const currentAuthFailure = response.status === 401 &&
       requestGeneration === authGeneration &&
-      requestCsrfToken === csrfToken &&
       !authMutation &&
-      path !== "/auth/session" &&
-      path !== "/auth/login" &&
-      !options.ignoreAuthExpired
-    ) {
-      beginAuthChange();
-      csrfToken = "";
-      if (typeof window !== "undefined") {
+      !path.startsWith("/auth/login") &&
+      !options.ignoreAuthExpired &&
+      typeof window !== "undefined";
+    if (currentAuthFailure) {
+      if (
+        requestCsrfToken &&
+        requestCsrfToken === csrfToken &&
+        path !== "/auth/session" &&
+        path !== "/auth/login"
+      ) {
+        beginAuthChange();
+        csrfToken = "";
         window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
       }
-    }
-    if (response.status === 401 && !path.startsWith("/auth/login") && typeof window !== "undefined") {
       clearCsrfToken();
       window.dispatchEvent(new CustomEvent<AuthRequiredEventDetail>(AUTH_REQUIRED_EVENT, {
         detail: { code: code ?? "authentication_required", message },

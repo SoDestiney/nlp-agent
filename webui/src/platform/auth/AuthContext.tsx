@@ -2,8 +2,6 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import {
   api,
-  AUTH_EXPIRED_EVENT,
-  AUTH_REQUIRED_EVENT,
   AuthStateChangedError,
   clearCsrfToken,
   ensureAuth,
@@ -11,6 +9,7 @@ import {
   subscribeAuthChanges,
   type AuthRequiredEventDetail,
 } from "@/platform/http/api";
+import { AUTH_EXPIRED_EVENT, AUTH_REQUIRED_EVENT } from "@/platform/auth/auth-events";
 import type { AuthSession } from "@/shared/types";
 
 interface AuthContextValue {
@@ -70,7 +69,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       clearCsrfToken();
       setUser(null);
       const shouldExplain = code === "authorization_changed" || code === "session_expired";
-      setIsAuthExpired(shouldExplain);
+      if (shouldExplain) setIsAuthExpired(true);
       setError(shouldExplain ? detail.message : "");
       setAuthNotice(shouldExplain ? detail.message : "");
     };

@@ -151,7 +151,7 @@ export function useStudentWorkspace() {
       socket.close();
       socketRef.current = null;
     };
-  }, [bootStatus, globalAuth?.refreshSession, handleEvent]);
+  }, [activeSessionRef, bootStatus, globalAuth?.refreshSession, handleEvent]);
 
   useEffect(() => {
     // AuthProvider is the single global 401 boundary. If a request made by

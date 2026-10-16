@@ -370,7 +370,7 @@ function RegisterForm({ onSuccess }: { onSuccess: () => void }) {
               onChange={(e) => setRegCaptchaCode(e.target.value)} disabled={submitting}
               placeholder="输入图中字符" maxLength={10} className={`${inputCls} min-w-0 flex-1`} />
             {regCaptchaImage && (
-              <img src={regCaptchaImage} alt="注册验证码" className={captchaImgCls}
+              <img src={regCaptchaImage} alt="注册验证码" className="h-16 w-40 rounded border border-gray-300 object-cover cursor-pointer"
                 onClick={() => void loadCaptcha("reg")} title="点击刷新" />
             )}
             <button type="button" onClick={() => void loadCaptcha("reg")}

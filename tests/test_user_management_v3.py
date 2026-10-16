@@ -19,7 +19,7 @@ from server.user.controller import _user_response_with_roles
 from server.user.schemas import UserCreate, UserCreateWithRole, UserRegister
 from server.user.phone import normalize_phone_number
 from server.user.service import UserAlreadyExistsError, UserService
-from server.web.auth import AuthenticationError, OriginRejectedError
+from server.web.auth import AuthorizationChangedError, AuthenticationError, OriginRejectedError
 from server.web.database_auth import DatabaseSessionAuth, DatabaseSessionClaims
 
 
@@ -345,7 +345,7 @@ async def test_password_change_revokes_database_sessions(mysql_session_factory) 
             select(SessionModel.revoked_at).where(SessionModel.user_id == user.id)
         )
         assert remaining is not None
-        with pytest.raises(AuthenticationError, match="invalid|expired"):
+        with pytest.raises(AuthorizationChangedError, match="authorization changed"):
             await auth.authenticate(mysql_session_factory, token)
 
 
