@@ -20,7 +20,8 @@ from server.rbac.catalog import permission_id, permission_row, role_id
 def test_migration_graph_has_one_head_after_all_feature_branches_are_merged() -> None:
     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
 
-    assert scripts.get_heads() == ["20261016_50_t06"]
+    assert scripts.get_heads() == ["20261016_51_t06_phone_identity"]
+    assert scripts.get_revision("20261016_51_t06_phone_identity").down_revision == "20261016_50_t06"
     assert scripts.get_revision("20261016_50_t06").down_revision == "20261015_49_t06"
     assert scripts.get_revision("20261015_49_t06").down_revision == "20261015_48_t06"
     assert scripts.get_revision("20261015_48_t06").down_revision == "20261010_48_cleanup_index"
@@ -58,10 +59,10 @@ def test_current_head_revision_fits_legacy_alembic_version_column() -> None:
 def test_historical_upgrade_entry_points_resolve_to_the_current_head(revision: str) -> None:
     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
 
-    path = list(scripts.iterate_revisions("20261016_50_t06", revision))
+    path = list(scripts.iterate_revisions("20261016_51_t06_phone_identity", revision))
 
     assert path
-    assert path[0].revision == "20261016_50_t06"
+    assert path[0].revision == "20261016_51_t06_phone_identity"
 
 
 def test_migration_revision_ids_fit_the_expanded_alembic_version_column() -> None:

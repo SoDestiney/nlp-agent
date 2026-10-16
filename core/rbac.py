@@ -27,6 +27,7 @@ class Permission(StrEnum):
     LEARNING_PROGRESS_READ_SELF = "learning:progress:read_self"
     LEARNING_CONTENT_MANAGE = "learning:content:manage"
     LEARNING_PROGRESS_READ_CLASSROOM = "learning:progress:read_classroom"
+    CLASSROOM_JOIN_REQUEST_SUBMIT = "classroom:join_request:submit"
     LEARNING_FEEDBACK_SUBMIT = "learning:feedback:submit"
     LEARNING_FEEDBACK_READ = "learning:feedback:read"
     LEARNING_FEEDBACK_WRITE = "learning:feedback:write"
@@ -99,6 +100,9 @@ _GUEST: Final[frozenset[Permission]] = frozenset(
         Permission.IDENTITY_PROFILE_UPDATE_SELF,
         Permission.IDENTITY_ACCOUNT_DELETE_SELF,
         Permission.LEARNING_CONTENT_READ_PUBLIC,
+        # A guest may request and inspect only their own classroom enrollment;
+        # this does not grant access to formal classroom learning content.
+        Permission.CLASSROOM_JOIN_REQUEST_SUBMIT,
         # 基础 agent 使用权限：guest 是"来试用智能体的人"，必须能创建/读写会话、提交对话。
         Permission.AGENT_SESSION_CREATE,
         Permission.AGENT_SESSION_READ,

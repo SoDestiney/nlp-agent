@@ -43,6 +43,11 @@ class UserModel(TimestampedModel, Base):
         # 生成列（见下方定义），保证 "Alice" 与 "alice" 在数据库层视为重复，
         # 杜绝同户名大小写不同的重复账号。
         Index("uq_nlp_users_username_lower", "username_lower", unique=True),
+        UniqueConstraint(
+            "phone_number_normalized", name="uq_nlp_users_phone_number_normalized"
+        ),
+        Index("ix_nlp_users_phone_number", "phone_number"),
+        Index("ix_nlp_users_phone_number_normalized", "phone_number_normalized"),
     )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
@@ -73,6 +78,8 @@ class UserModel(TimestampedModel, Base):
     email_normalized: Mapped[str | None] = mapped_column(
         String(254), nullable=True, unique=True, index=True
     )
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_number_normalized: Mapped[str | None] = mapped_column(String(16), nullable=True)
     registration_source: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="manual"
     )

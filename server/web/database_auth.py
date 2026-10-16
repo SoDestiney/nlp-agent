@@ -34,8 +34,15 @@ from server.infrastructure.mysql.models import (
     WsTicketModel,
 )
 from server.user.service import PasswordHasherSingleton
+from server.user.phone import normalize_phone_number
 from server.sandbox.service import sandbox_lifecycle_service
-from server.web.auth import AuthenticationError, CsrfRejectedError, LoginRateLimitError, OriginRejectedError
+from server.web.auth import (
+    AuthenticationError,
+    AuthorizationChangedError,
+    CsrfRejectedError,
+    LoginRateLimitError,
+    OriginRejectedError,
+)
 
 
 def _utc_now() -> datetime:
@@ -267,12 +274,20 @@ class DatabaseSessionAuth:
             raise LoginRateLimitError(retry_after_s)
 
         async with factory.begin() as session:
-            # 主登录入口同时接受用户名与规范化邮箱。邮箱命中唯一的
-            # ``email_normalized`` 索引；预置/后台账号仍可用用户名登录。
+            # Login accepts usernames, normalized email, and canonical phone
+            # identity; manually provisioned accounts keep username login.
             identity_criteria = (
                 (UserModel.username_lower == normalized)
                 | (UserModel.email_normalized == normalized)
             )
+            try:
+                phone_identity = normalize_phone_number(username)
+            except ValueError:
+                phone_identity = None
+            if phone_identity is not None:
+                identity_criteria = identity_criteria | (
+                    UserModel.phone_number_normalized == phone_identity
+                )
             user = await session.scalar(
                 select(UserModel)
                 .where(
@@ -353,25 +368,40 @@ class DatabaseSessionAuth:
         if not token:
             raise AuthenticationError("authentication cookie is missing")
         digest = self.token_hash(token)
-        failure: str | None = None
+        failure: AuthenticationError | None = None
         claims: DatabaseSessionClaims | None = None
         async with factory.begin() as session:
-            row = await self._active_row(session, digest)
+            # Load the row even when it is already expired or revoked so the
+            # client receives the stable reason (session expiry versus an
+            # authorization change) instead of a generic invalid-cookie code.
+            row = await session.scalar(
+                select(SessionModel)
+                .options(joinedload(SessionModel.user))
+                .where(SessionModel.token_hash == digest)
+            )
             if row is None:
                 raise AuthenticationError("authentication cookie is invalid")
             now = _utc_now()
-            if row.last_seen_at is not None and (
+            if row.expires_at <= now:
+                failure = AuthenticationError("authentication cookie has expired")
+            elif row.revoked_at is not None:
+                if row.authorization_version != row.user.authorization_version:
+                    failure = AuthorizationChangedError("authorization changed")
+                else:
+                    failure = AuthenticationError("authentication cookie is invalid")
+            elif row.last_seen_at is not None and (
                 now - row.last_seen_at
             ).total_seconds() > self.idle_timeout_s:
                 row.revoked_at = now
-                failure = "authentication cookie has expired"
+                failure = AuthenticationError("authentication cookie has expired")
             elif (
                 row.authorization_version != row.user.authorization_version
-                or row.user.status != "active"
-                or row.user.deleted_at is not None
             ):
                 row.revoked_at = now
-                failure = "authentication cookie has expired"
+                failure = AuthorizationChangedError("authorization changed")
+            elif row.user.status != "active" or row.user.deleted_at is not None:
+                row.revoked_at = now
+                failure = AuthenticationError("authentication cookie has expired")
             elif touch:
                 row.last_seen_at = now
                 # Limit sliding TTL: extend the absolute expiry up to a maximum of the original
@@ -389,7 +419,7 @@ class DatabaseSessionAuth:
             if failure is None:
                 claims = self._claims(row)
         if failure is not None:
-            raise AuthenticationError(failure)
+            raise failure
         assert claims is not None
         return claims
 
@@ -565,12 +595,16 @@ class DatabaseSessionAuth:
                 .where(SessionModel.id == row.auth_session_id)
                 .with_for_update()
             )
-            if auth_session is None or auth_session.revoked_at is not None:
+            if auth_session is None:
+                raise AuthenticationError("authentication session is revoked")
+            if auth_session.revoked_at is not None:
+                if auth_session.authorization_version != auth_session.user.authorization_version:
+                    raise AuthorizationChangedError("authorization changed")
                 raise AuthenticationError("authentication session is revoked")
             if auth_session.expires_at <= now or auth_session.user.status != "active" or auth_session.user.deleted_at is not None:
                 raise AuthenticationError("authentication session is expired")
             if auth_session.authorization_version != auth_session.user.authorization_version:
-                raise AuthenticationError("authentication session is expired")
+                raise AuthorizationChangedError("authorization changed")
             row.used_at = now
             return self._claims(auth_session)
 
@@ -588,12 +622,18 @@ class DatabaseSessionAuth:
                 .where(SessionModel.id == session_id)
             )
             now = _utc_now()
-            if row is None or row.revoked_at is not None or row.expires_at <= now:
+            if row is None:
                 raise AuthenticationError("authentication session is expired")
+            if row.expires_at <= now:
+                raise AuthenticationError("authentication session is expired")
+            if row.revoked_at is not None:
+                if row.authorization_version != row.user.authorization_version:
+                    raise AuthorizationChangedError("authorization changed")
+                raise AuthenticationError("authentication session is revoked")
             if row.user.status != "active" or row.user.deleted_at is not None:
                 raise AuthenticationError("authentication session is expired")
             if row.authorization_version != row.user.authorization_version:
-                raise AuthenticationError("authentication session is expired")
+                raise AuthorizationChangedError("authorization changed")
             if touch:
                 row.last_seen_at = now
             return self._claims(row)
