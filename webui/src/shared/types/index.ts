@@ -911,3 +911,55 @@ export interface UserListResponse {
   offset: number;
   limit: number;
 }
+export interface Workspace {
+  id: string;
+  slug: string;
+  name: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface WorkspaceMember {
+  workspace_id: string;
+  user_id: string;
+  member_type: string;
+  status: string;
+  created_at: string;
+}
+
+export interface ClassroomSummary {
+  id: string;
+  workspace_id: string;
+  name: string;
+  status: string;
+}
+
+export interface ClassroomCreatedResponse extends ClassroomSummary {
+  join_code: string;
+}
+
+export interface ClassroomJoinCodeResponse {
+  classroom_id: string;
+  classroom_name: string;
+  join_code: string;
+}
+
+export interface JoinRequest {
+  id: string;
+  class_id: string;
+  class_name: string;
+  user_id: string;
+  user_name: string;
+  display_name: string;
+  student_number: string | null;
+  status: string;
+  requested_at: string;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+}
+
+export interface JoinRequestListResponse {
+  items: JoinRequest[];
+  total: number;
+}

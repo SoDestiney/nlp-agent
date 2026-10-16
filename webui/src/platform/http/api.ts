@@ -1,7 +1,13 @@
-import type { AuthSession, AuthorizationAuditListResponse, AuthorizationAuditSummary, DeveloperRuntimeHealth, DeveloperSnapshot, FeedbackCategory, FeedbackDailyState, FeedbackPriority, FeedbackStatus, FeedbackThread, FeedbackThreadList, LearningBookNavigationItem, LearningBookPage, QuotaAdjustment, QuotaAlert, QuotaArchiveBatch, QuotaBillingRecord, QuotaBillingStatementInput, QuotaBinding, QuotaBucketCandidate, QuotaBucketReplay, QuotaCreditOperation, QuotaCreditOperationInput, QuotaDailyRollup, QuotaGrant, QuotaPolicy, QuotaPolicyExplanation, QuotaPolicyUpdateInput, QuotaPricingRule, QuotaRoleCreditOperationInput, QuotaRoleCreditOperationResult, QuotaSnapshot, QuotaUsageSnapshot, RbacPermission, RbacRole, ReleaseNoteEntry, SessionListResponse, SettingsRuntime, SystemMenu, TeacherAIAnalysisResult, TeacherBookArchiveImportPreview, TeacherBookAssetInput, TeacherBookFile, TeacherBookImportPreview, TeacherBookNavigationItem, TeacherBookPage, TeacherCatalog, TeacherOverview, TeacherAnalysisAnnotations, TeachingGoals, SessionSummary, TurnRecord, UserSettings, UserListResponse, UserProfile, WhiteboardLibraryItem } from "@/shared/types";
+import type { AgentSessionStats, AuthSession, AuthorizationAuditListResponse, AuthorizationAuditSummary, ClassroomCreatedResponse, ClassroomJoinCodeResponse, ClassroomSummary, DeveloperRuntimeHealth, DeveloperSnapshot, FeedbackCategory, FeedbackDailyState, FeedbackPriority, FeedbackStatus, FeedbackThread, FeedbackThreadList, JoinRequest, JoinRequestListResponse, LearningBookNavigationItem, LearningBookPage, QuotaAdjustment, QuotaAlert, QuotaArchiveBatch, QuotaBillingRecord, QuotaBillingStatementInput, QuotaBinding, QuotaBucketCandidate, QuotaBucketReplay, QuotaCreditOperation, QuotaCreditOperationInput, QuotaDailyRollup, QuotaGrant, QuotaPolicy, QuotaPolicyExplanation, QuotaPolicyUpdateInput, QuotaPricingRule, QuotaRoleCreditOperationInput, QuotaRoleCreditOperationResult, QuotaSnapshot, QuotaUsageSnapshot, RbacPermission, RbacRole, ReleaseNoteEntry, SessionListResponse, SettingsRuntime, SystemMenu, TeacherAIAnalysisResult, TeacherBookArchiveImportPreview, TeacherBookAssetInput, TeacherBookFile, TeacherBookImportPreview, TeacherBookNavigationItem, TeacherBookPage, TeacherCatalog, TeacherOverview, TeacherAnalysisAnnotations, TeachingGoals, SessionSummary, TurnRecord, UserSettings, UserListResponse, UserProfile, WhiteboardLibraryItem, Workspace, WorkspaceMember } from "@/shared/types";
 
 const API_ROOT = "/api/v1";
 export const AUTH_EXPIRED_EVENT = "nova:auth-expired";
+export const AUTH_REQUIRED_EVENT = "nlp-auth-required";
+
+export interface AuthRequiredEventDetail {
+  code: string;
+  message: string;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -19,6 +25,10 @@ let authRequest: Promise<AuthSession> | null = null;
 let authGeneration = 0;
 let authMutation: Promise<void> | null = null;
 const AUTH_CHANGED_STORAGE_KEY = "nova:auth-changed";
+
+export function clearCsrfToken(): void {
+  csrfToken = "";
+}
 
 export class AuthStateChangedError extends Error {
   constructor() {
@@ -96,10 +106,17 @@ async function request<T>(
     credentials: "include",
   });
   if (!response.ok) {
-    const problem = await response.json().catch(() => ({})) as { detail?: string; title?: string; code?: string };
+    const problem = await response.json().catch(() => ({})) as { detail?: unknown; title?: string; code?: string };
+    const nestedDetail = typeof problem.detail === "object" && problem.detail !== null
+      ? problem.detail as { code?: string; detail?: string; message?: string }
+      : null;
+    const code = problem.code ?? nestedDetail?.code;
+    const message = typeof problem.detail === "string"
+      ? problem.detail
+      : nestedDetail?.detail ?? nestedDetail?.message ?? problem.title ?? `HTTP ${response.status}`;
     if (
       response.status === 403 &&
-      problem.code === "csrf_rejected" &&
+      code === "csrf_rejected" &&
       retryCsrf &&
       !["GET", "HEAD", "OPTIONS"].includes(method) &&
       path !== "/auth/session" &&
@@ -113,27 +130,33 @@ async function request<T>(
       return request<T>(path, init, false, options);
     }
     if (
-  response.status === 401 &&
-  requestCsrfToken &&
-  requestGeneration === authGeneration &&
-  requestCsrfToken === csrfToken &&
-  !authMutation &&
-  path !== "/auth/session" &&
-  path !== "/auth/login" &&
-  !options.ignoreAuthExpired
-) {
-  beginAuthChange();
-  csrfToken = "";
-  if (typeof window !== "undefined") {
-    window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-  }
-}
+      response.status === 401 &&
+      requestCsrfToken &&
+      requestGeneration === authGeneration &&
+      requestCsrfToken === csrfToken &&
+      !authMutation &&
+      path !== "/auth/session" &&
+      path !== "/auth/login" &&
+      !options.ignoreAuthExpired
+    ) {
+      beginAuthChange();
+      csrfToken = "";
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+      }
+    }
+    if (response.status === 401 && !path.startsWith("/auth/login") && typeof window !== "undefined") {
+      clearCsrfToken();
+      window.dispatchEvent(new CustomEvent<AuthRequiredEventDetail>(AUTH_REQUIRED_EVENT, {
+        detail: { code: code ?? "authentication_required", message },
+      }));
+    }
     const seconds = Number(response.headers.get("Retry-After"));
     const retryAfterSeconds = Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds) : undefined;
-    const message = response.status === 429 && problem.code === "login_rate_limited"
+    const resolvedMessage = response.status === 429 && code === "login_rate_limited"
       ? retryAfterSeconds ? `登录尝试过多，请等待 ${retryAfterSeconds} 秒后重试。` : "登录尝试过多，请稍后重试。"
-      : problem.detail ?? problem.title ?? `HTTP ${response.status}`;
-    throw new ApiError(message, response.status, problem.code, retryAfterSeconds);
+      : message;
+    throw new ApiError(resolvedMessage, response.status, code, retryAfterSeconds);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
@@ -581,15 +604,44 @@ export const api = {
     return request<AuthorizationAuditListResponse>(`/audit/authorization${suffix}`);
   },
   getAuthorizationAuditStats: (days = 30) => request<AuthorizationAuditSummary>(`/audit/authorization/stats?days=${days}`),
+  listWorkspaces: () => request<{ workspaces: Workspace[]; total: number }>("/workspaces"),
+  listWorkspaceMembers: (workspaceId: string) =>
+    request<WorkspaceMember[]>(`/workspaces/${encodeURIComponent(workspaceId)}/members`),
+  listClassrooms: () => request<{ items: ClassroomSummary[] }>("/classrooms"),
+  createClassroom: (input: { workspace_id: string; name: string }) =>
+    request<ClassroomCreatedResponse>("/classrooms", { method: "POST", body: JSON.stringify(input) }),
+  getClassroomJoinCode: (classroomId: string) =>
+    request<ClassroomJoinCodeResponse>(`/classrooms/${encodeURIComponent(classroomId)}/join-code`),
+  listJoinRequests: (classroomId: string) =>
+    request<JoinRequestListResponse>(`/classrooms/${encodeURIComponent(classroomId)}/join-requests`),
+  approveJoinRequest: (classroomId: string, requestId: string) =>
+    request<JoinRequest>(
+      `/classrooms/${encodeURIComponent(classroomId)}/join-requests/${encodeURIComponent(requestId)}/approve`,
+      { method: "POST", body: "{}" },
+    ),
+  rejectJoinRequest: (classroomId: string, requestId: string) =>
+    request<JoinRequest>(
+      `/classrooms/${encodeURIComponent(classroomId)}/join-requests/${encodeURIComponent(requestId)}/reject`,
+      { method: "POST" },
+    ),
+  submitClassroomJoinRequest: (input: { join_code: string; student_number?: string }) =>
+    request<JoinRequest>("/classrooms/join-requests", { method: "POST", body: JSON.stringify(input) }),
+  listMyJoinRequests: () =>
+    request<JoinRequestListResponse>("/classrooms/my-join-requests"),
   // ---------------------------------------------------------------------------
   // Registration (public)
   // ---------------------------------------------------------------------------
   getCaptcha: () =>
     request<{ captcha_id: string; image: string }>("/auth/captcha"),
-  register: (data: { email: string; email_code: string; password: string; display_name?: string; captcha_id: string; captcha_code: string }) =>
-    request<UserProfile>("/auth/register", {
+  register: (data: { phone_number: string; sms_code: string; password: string; display_name?: string; captcha_id: string; captcha_code: string }) =>
+    request<{ message: string; user_id: string; username: string; display_name: string; roles: string[] }>("/auth/register", {
       method: "POST",
       body: JSON.stringify(data),
+    }),
+  sendSmsCode: (phoneNumber: string, captchaId: string, captchaCode: string) =>
+    request<{ message: string }>("/auth/sms/send", {
+      method: "POST",
+      body: JSON.stringify({ phone_number: phoneNumber, captcha_id: captchaId, captcha_code: captchaCode }),
     }),
   sendEmailCode: (email: string, captchaId: string, captchaCode: string) =>
     request<{ message: string; expires_in?: number; resend_after?: number }>("/auth/email/send", {
