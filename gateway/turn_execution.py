@@ -19,6 +19,7 @@ from gateway.engine import AgentEngine
 from gateway.state import TurnExecutionState
 from core.model_runtime.usage import UsageAttributionContext, bind_usage_attribution
 from server.quota.contracts import FinishTurn
+from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
 
 
 EventSink = Callable[[str, str, GatewayEventType, dict], Awaitable[None]]
@@ -236,6 +237,9 @@ class InProcessTurnExecutor:
                     return
         except asyncio.CancelledError:
             await self._engine.cancel_turn(task.context, task.turn_id)
+            # Interruption of a fenced owner is recoverable, not a user cancel.
+            if current_turn_write_fence() is not None:
+                raise
             updated = await asyncio.to_thread(
                 self._repository.update_turn,
                 task.turn_id,
@@ -252,6 +256,8 @@ class InProcessTurnExecutor:
                     **fence,
                 )
             await self._finish_quota(task)
+            raise
+        except LostTurnClaimError:
             raise
         except Exception as error:
             await self._converge_failed_turn(task, error, execution_context)

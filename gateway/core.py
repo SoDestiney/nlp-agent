@@ -37,6 +37,7 @@ from gateway.contracts import (
     TurnRecord,
     TurnStatus,
     WhiteboardLibraryInUseError,
+    WorkerUnavailableError,
 )
 from gateway.dispatch import (
     ExecutionAuthorizationContext,
@@ -205,6 +206,10 @@ class BackendGateway:
                         "redis_dead_letter_stream", "nlp-agent:turns:dead"
                     )
                 ),
+                worker_concurrency=int(gateway_config.get("worker_concurrency", 4)),
+                shutdown_grace_s=float(gateway_config.get("worker_shutdown_grace_s", 30)),
+                worker_heartbeat_interval_s=float(gateway_config.get("worker_heartbeat_interval_s", 5)),
+                worker_heartbeat_ttl_s=int(gateway_config.get("worker_heartbeat_ttl_s", 15)),
             )
             redis_dispatcher = RedisTurnDispatcher.from_config(redis_config)
             if self._database_runtime is None:
@@ -430,6 +435,11 @@ class BackendGateway:
                     status=existing.status,
                     duplicate=True,
                 )
+        healthy_workers = getattr(self.dispatcher, "healthy_worker_count", None)
+        if self._remote_execution and healthy_workers is not None:
+            worker_count = await healthy_workers()
+            if worker_count == 0:
+                raise WorkerUnavailableError("no healthy turn workers are available")
         active = await asyncio.to_thread(
             self.repository.active_turn_for_session, context.session_id
         )
@@ -1368,8 +1378,12 @@ class BackendGateway:
         event_type: GatewayEventType,
         payload: dict | None = None,
     ) -> GatewayEvent:
+        writer = self.repository.ensure_event if event_type in {
+            GatewayEventType.MESSAGE_COMPLETED, GatewayEventType.TURN_COMPLETED,
+            GatewayEventType.TURN_FAILED, GatewayEventType.TURN_CANCELLED,
+        } else self.repository.append_event
         event = await asyncio.to_thread(
-            self.repository.append_event,
+            writer,
             turn_id=turn_id,
             session_id=session_id,
             event_type=event_type,

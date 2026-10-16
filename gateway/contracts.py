@@ -161,6 +161,12 @@ class GatewayNotStartedError(RuntimeError):
     pass
 
 
+class WorkerUnavailableError(RuntimeError):
+    """No healthy Worker is currently available to accept new classroom work."""
+
+    pass
+
+
 class TurnConflictError(RuntimeError):
     pass
 

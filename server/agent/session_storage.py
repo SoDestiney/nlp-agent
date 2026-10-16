@@ -372,7 +372,8 @@ async def record_transcript(
     暴露给上层的封装调用：对比当前 Graph 内的 messages 链，提取并附加新消息。
     """
     """Persist the current transcript snapshot in MySQL; JSONL is legacy-read only."""
-    from sqlalchemy import create_engine, delete, text
+    from sqlalchemy import delete, text
+    from server.infrastructure.mysql.sync_engine import configured_engine, release_engine
     from sqlalchemy.dialects.mysql import insert
     from configs.settings import settings
     from server.infrastructure.mysql.models import ConversationTranscriptModel
@@ -383,7 +384,7 @@ async def record_transcript(
         url = settings.NLP_AGENT_DATABASE_URL.strip()
         if not url:
             raise RuntimeError("NLP_AGENT_DATABASE_URL is required for transcript storage")
-        engine = create_engine(url.replace("mysql+aiomysql://", "mysql+pymysql://"), pool_pre_ping=True)
+        engine = configured_engine(url, settings.database_runtime)
         try:
             with engine.begin() as connection:
                 if not user_id or not workspace_id:
@@ -441,7 +442,7 @@ async def record_transcript(
                 else:
                     quota.reconcile()
         finally:
-            engine.dispose()
+            release_engine(engine)
 
     await asyncio.to_thread(persist)
 

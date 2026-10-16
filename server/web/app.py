@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyCookie
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
@@ -36,6 +37,7 @@ from gateway.contracts import (
     ResourceNotFoundError,
     SubmitTurnRequest,
     TurnConflictError,
+    WorkerUnavailableError,
     WhiteboardLibraryInUseError,
 )
 from gateway.core import BackendGateway
@@ -200,6 +202,7 @@ from server.user.email_provider import (
 )
 from server.user.email import InvalidEmailError, normalize_email
 from server.user.tencent_sms import create_tencent_sms_provider_from_env
+from server.user.tencent_sms import BoundedSmsSender, SmsGatewayBusyError, SmsGatewayFailedError, SmsGatewayTimeoutError
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 
@@ -209,6 +212,7 @@ GatewayFactory = Callable[[], BackendGateway]
 # Strong references to in-flight authorization-audit flush tasks so the
 # deferred writes survive garbage collection until they finish.
 _pending_audit_tasks: set[asyncio.Task] = set()
+_sms_sender = BoundedSmsSender(max_concurrency=8, timeout_s=5)
 
 
 def _is_registration_unique_conflict(error: IntegrityError) -> bool:
@@ -305,6 +309,7 @@ def _problem(
     title: str,
     detail: str | None = None,
     extra: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None)
     body: dict[str, Any] = {
@@ -319,7 +324,12 @@ def _problem(
         body["request_id"] = request_id
     if extra:
         body.update(extra)
-    return JSONResponse(body, status_code=status_code, media_type="application/problem+json")
+    return JSONResponse(
+        body,
+        status_code=status_code,
+        media_type="application/problem+json",
+        headers=headers,
+    )
 
 
 def _is_quota_schema_mismatch(error: OperationalError) -> bool:
@@ -1015,6 +1025,58 @@ def create_app(
             title="Backend Gateway is not ready",
         )
 
+    @app.exception_handler(WorkerUnavailableError)
+    async def worker_unavailable(request: Request, _error: WorkerUnavailableError):
+        return _problem(
+            request,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="worker_unavailable",
+            title="No healthy classroom workers are available",
+            headers={"Retry-After": "5"},
+        )
+
+    @app.exception_handler(SmsGatewayBusyError)
+    async def sms_gateway_busy(request: Request, _error: SmsGatewayBusyError):
+        return _problem(
+            request,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="sms_gateway_busy",
+            title="SMS gateway is busy",
+            headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(SmsGatewayTimeoutError)
+    async def sms_gateway_timeout(request: Request, _error: SmsGatewayTimeoutError):
+        return _problem(
+            request,
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code="sms_gateway_timeout",
+            title="SMS gateway timed out",
+        )
+
+    @app.exception_handler(SmsGatewayFailedError)
+    async def sms_gateway_failed(request: Request, _error: SmsGatewayFailedError):
+        return _problem(
+            request,
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code="sms_gateway_failed",
+            title="SMS gateway failed",
+            detail="SMS gateway failed",
+        )
+
+    @app.exception_handler(SQLAlchemyError)
+    async def database_error(request: Request, error: SQLAlchemyError):
+        from server.infrastructure.mysql.errors import database_problem
+
+        code, title, retry_after = database_problem(error)
+        return _problem(
+            request,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code=code,
+            title=title,
+            headers={"Retry-After": retry_after} if retry_after else None,
+        )
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, error: RequestValidationError):
         return _problem(
@@ -1043,9 +1105,12 @@ def create_app(
     async def health_ready(request: Request):
         health = await request.app.state.gateway.health()
         ready = health.started and health.accepting_turns and health.status == "ok"
+        from server.storage.monitoring import deployment_environment
+
         return JSONResponse(
             {
                 "status": "ready" if ready else "not_ready",
+                "deployment_environment": deployment_environment(),
                 "active_turns": health.active_turns,
                 "durable_events": health.durable_events,
             },
@@ -1129,41 +1194,75 @@ def create_app(
                 "resend_after": code_store.EMAIL_RESEND_COOLDOWN_S}
 
     @app.post("/api/v1/auth/sms/send", status_code=status.HTTP_200_OK, tags=["auth"])
-    async def send_sms_code(body: SmsCodeRequest, db: DbSession, request: Request):
-        """Validate a CAPTCHA and issue a short-lived SMS verification code."""
-        await code_store.purge_expired(db)
-        if not await code_store.consume_code(
-            db, kind="captcha", subject=body.captcha_id, code=body.captcha_code
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired CAPTCHA",
-            )
+    async def send_sms_code(body: SmsCodeRequest, request: Request):
+        """Validate the image CAPTCHA, then issue an SMS verification code.
+
+        Server-side controls (the frontend 60s countdown is UX only):
+        - the CAPTCHA answer is consumed single-use from ``nlp_auth_codes``;
+        - per-phone cooldown / per-phone hourly / per-IP hourly send limits;
+        - real delivery via Tencent Cloud SMS when ``TENCENT_SMS_*`` env vars
+          are configured, otherwise the code is printed to the server console
+          (development fallback);
+        - the code is stored hashed with a hard 120s expiry enforced at
+          consumption time.
+        """
         phone = body.phone_number.strip()
         client_ip = request.client.host if request.client else None
-        allowed, reason = await code_store.sms_send_allowed(
-            db, phone=phone, client_ip=client_ip
-        )
-        if not allowed:
-            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=reason)
+        factory = getattr(request.app.state.gateway, "authorization_session_factory", None)
+        if factory is None:
+            raise RuntimeError("SMS verification requires MySQL")
+        failure: HTTPException | None = None
+        attempt_id: str | None = None
+        async with factory() as db:
+            async with db.begin():
+                await code_store.purge_expired(db)
+                if not await code_store.consume_code(
+                    db, kind="captcha", subject=body.captcha_id, code=body.captcha_code
+                ):
+                    failure = HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invalid or expired CAPTCHA",
+                    )
+                else:
+                    allowed, reason = await code_store.sms_send_allowed(
+                        db, phone=phone, client_ip=client_ip
+                    )
+                    if not allowed:
+                        failure = HTTPException(
+                            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail=reason,
+                        )
+                    else:
+                        attempt_id = await code_store.reserve_sms_attempt(
+                            db, phone=phone, client_ip=client_ip
+                        )
+        if failure is not None:
+            raise failure
+        if attempt_id is None:
+            raise RuntimeError("SMS delivery attempt was not reserved")
         code = generate_sms_code()
         provider = create_tencent_sms_provider_from_env()
         if provider is not None:
-            if not await provider.send_verification_code(phone, code):
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="SMS gateway failed to deliver the code",
-                )
+            try:
+                sent = await _sms_sender.send(provider, phone, code)
+            except (SmsGatewayBusyError, SmsGatewayTimeoutError):
+                raise
+            except Exception as error:
+                logger.exception("SMS provider request failed")
+                raise SmsGatewayFailedError("SMS provider request failed") from error
+            if not sent:
+                raise SmsGatewayFailedError("SMS provider rejected the delivery")
         else:
-            logger.warning("[SMS] Development verification code for %s: %s", phone, code)
-        await code_store.put_code(
-            db,
-            kind="sms",
-            subject=phone,
-            code=code,
-            ttl_s=code_store.SMS_CODE_TTL_S,
-            client_ip=client_ip,
-        )
+            # Development fallback: no Tencent Cloud credentials configured.
+            print(f"[SMS] Verification code for {phone}: {code}")
+        async with factory() as db:
+            async with db.begin():
+                await code_store.complete_sms_attempt(
+                    db,
+                    attempt_id=attempt_id,
+                    code=code,
+                    ttl_s=code_store.SMS_CODE_TTL_S,
+                )
         return {"message": "SMS code sent successfully"}
 
     @app.post("/api/v1/auth/login", status_code=status.HTTP_200_OK, tags=["auth"])

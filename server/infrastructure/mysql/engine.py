@@ -16,6 +16,7 @@ def create_engine(config: DatabaseConfig) -> AsyncEngine:
         pool_pre_ping=True,
         pool_size=config.pool_size,
         max_overflow=config.max_overflow,
+        pool_timeout=config.pool_timeout_s,
         pool_recycle=config.pool_recycle_s,
         connect_args={
             "connect_timeout": config.connect_timeout_s,

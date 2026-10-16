@@ -69,9 +69,16 @@ class Settings(BaseSettings):
     NLP_AGENT_QUOTA_ENFORCEMENT_PERCENT: int | None = None
     NLP_AGENT_QUOTA_ENFORCEMENT_USERS: str = ""
     NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES: str = ""
-    NLP_AGENT_DB_POOL_SIZE: int = 10
-    NLP_AGENT_DB_MAX_OVERFLOW: int = 20
+    NLP_AGENT_DB_POOL_SIZE: int = 5
+    NLP_AGENT_DB_MAX_OVERFLOW: int = 5
+    NLP_AGENT_DB_SYNC_POOL_SIZE: int = 5
+    NLP_AGENT_DB_SYNC_MAX_OVERFLOW: int = 5
+    NLP_AGENT_DB_POOL_TIMEOUT_S: int = 5
     NLP_AGENT_DB_POOL_RECYCLE_S: int = 1800
+    NLP_AGENT_WORKER_CONCURRENCY: int = 4
+    NLP_AGENT_WORKER_SHUTDOWN_GRACE_S: float = 30.0
+    NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S: float = 5.0
+    NLP_AGENT_WORKER_HEARTBEAT_TTL_S: int = 15
     NLP_AGENT_DB_CONNECT_TIMEOUT_S: int = 5
     NLP_AGENT_DB_STATEMENT_TIMEOUT_S: int = 30
     # Timezone used to bucket teacher-analytics hour/weekday and peak-hour
@@ -214,6 +221,10 @@ class Settings(BaseSettings):
             config["quota_enforcement_users"] = self.NLP_AGENT_QUOTA_ENFORCEMENT_USERS
         if self.NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES.strip():
             config["quota_enforcement_workspaces"] = self.NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES
+        config["worker_concurrency"] = self.NLP_AGENT_WORKER_CONCURRENCY
+        config["worker_shutdown_grace_s"] = self.NLP_AGENT_WORKER_SHUTDOWN_GRACE_S
+        config["worker_heartbeat_interval_s"] = self.NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S
+        config["worker_heartbeat_ttl_s"] = self.NLP_AGENT_WORKER_HEARTBEAT_TTL_S
         return config
 
     @property
@@ -242,6 +253,9 @@ class Settings(BaseSettings):
                 "url": self.NLP_AGENT_DATABASE_URL.strip(),
                 "pool_size": self.NLP_AGENT_DB_POOL_SIZE,
                 "max_overflow": self.NLP_AGENT_DB_MAX_OVERFLOW,
+                "sync_pool_size": self.NLP_AGENT_DB_SYNC_POOL_SIZE,
+                "sync_max_overflow": self.NLP_AGENT_DB_SYNC_MAX_OVERFLOW,
+                "pool_timeout_s": self.NLP_AGENT_DB_POOL_TIMEOUT_S,
                 "pool_recycle_s": self.NLP_AGENT_DB_POOL_RECYCLE_S,
                 "connect_timeout_s": self.NLP_AGENT_DB_CONNECT_TIMEOUT_S,
                 "statement_timeout_s": self.NLP_AGENT_DB_STATEMENT_TIMEOUT_S,

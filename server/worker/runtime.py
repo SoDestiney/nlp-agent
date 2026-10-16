@@ -61,6 +61,10 @@ def redis_config() -> RedisTransportConfig:
         dead_letter_stream=str(
             config.get("redis_dead_letter_stream", "nlp-agent:turns:dead")
         ),
+        worker_concurrency=int(config.get("worker_concurrency", 4)),
+        shutdown_grace_s=float(config.get("worker_shutdown_grace_s", 30)),
+        worker_heartbeat_interval_s=float(config.get("worker_heartbeat_interval_s", 5)),
+        worker_heartbeat_ttl_s=int(config.get("worker_heartbeat_ttl_s", 15)),
     )
 
 def create_worker_quota_reaper(
@@ -132,7 +136,7 @@ async def run_worker() -> None:
             event_arguments["expected_claim_generation"] = (
                 execution_context.claim_generation
             )
-        event = await asyncio.to_thread(repository.append_event, **event_arguments)
+        event = await asyncio.to_thread((repository.ensure_event if event_type in {GatewayEventType.MESSAGE_COMPLETED, GatewayEventType.TURN_COMPLETED, GatewayEventType.TURN_FAILED, GatewayEventType.TURN_CANCELLED} else repository.append_event), **event_arguments)
         await publisher.publish(event)
 
     async def cancel_pending(task) -> None:
@@ -146,9 +150,9 @@ async def run_worker() -> None:
         }:
             return
         if turn.status != TurnStatus.CANCELLED:
-            await asyncio.to_thread(
-                repository.update_turn, task.turn_id, TurnStatus.CANCELLED
-            )
+            # A Redis hint is not authority to mutate a newer generation.
+            # The Web command persists cancellation before sending that hint.
+            return
         event = await asyncio.to_thread(
             repository.ensure_event,
             turn_id=task.turn_id,
@@ -246,10 +250,17 @@ async def run_worker() -> None:
     async def relay_forever() -> None:
         relay = OutboxRelay(redis, stream=config.task_stream, relay_id=worker_id, authorization_channel=config.authorization_channel)
         while True:
-            async with database_runtime.uow.begin() as unit_of_work:
-                await reliability.recover_stuck_turns(unit_of_work.session)
-                await relay.publish_batch(unit_of_work.session)
-                await unit_of_work.commit()
+            try:
+                async with database_runtime.uow.begin() as unit_of_work:
+                    await reliability.recover_stuck_turns(unit_of_work.session)
+                    await unit_of_work.commit()
+                await relay.publish_batch(database_runtime.uow)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                import logging
+
+                logging.getLogger(__name__).exception("worker outbox relay iteration failed")
             await asyncio.sleep(0.5)
 
     relay_task = asyncio.create_task(relay_forever(), name="mysql-outbox-relay")

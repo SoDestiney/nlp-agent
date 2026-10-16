@@ -28,6 +28,9 @@ class OutboxTurnDispatcher:
         """
         self._active.add(task.turn_id)
 
+    async def healthy_worker_count(self) -> int | None:
+        return await self._transport.healthy_worker_count()
+
     async def cancel(self, turn_id: str) -> None:
         await self._transport.cancel(turn_id)
         self._active.discard(turn_id)

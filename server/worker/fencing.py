@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from gateway.dispatch import TurnTask
+from gateway.execution_fence import TurnWriteFence, bind_turn_write_fence
 from core.rbac import Permission, authorization_service
 from core.rbac import required_permission_for_high_risk_tool
 from core.identity import AuthenticatedPrincipal
@@ -114,6 +115,7 @@ class FencedTurnExecutor:
         heartbeat = asyncio.create_task(
             self._heartbeat(task.turn_id, generation), name=f"turn-lease:{task.turn_id}"
         )
+        fence = TurnWriteFence(task.turn_id, generation, self._worker_id)
         execution_context = TurnExecutionContext(
             turn_id=task.turn_id,
             claim_generation=generation,
@@ -121,8 +123,12 @@ class FencedTurnExecutor:
             principal=principal,
             workspace_id=task.authorization.workspace_id,
         )
+        async def execute_owned() -> None:
+            with bind_turn_write_fence(fence):
+                await self._execute_with_context(task, execution_context)
+
         execution = asyncio.create_task(
-            self._execute_with_context(task, execution_context),
+            execute_owned(),
             name=f"turn-execution:{task.turn_id}",
         )
         try:
@@ -131,6 +137,7 @@ class FencedTurnExecutor:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if heartbeat in completed:
+                fence.revoke()
                 error = heartbeat.exception()
                 if error is None:
                     raise RuntimeError("turn lease heartbeat stopped unexpectedly")
@@ -138,7 +145,9 @@ class FencedTurnExecutor:
             await execution
             return True
         finally:
+            fence.revoke()
             if not execution.done():
+                fence.revoke()
                 execution.cancel()
                 try:
                     await asyncio.wait_for(
