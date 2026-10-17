@@ -378,6 +378,10 @@ nlp_model_usage_events
 1. 解析实际 model profile 和 role。
 2. 完整 Prompt 在 Worker 组装，接单阶段采用所选 coordinator 模型最大输入上下文加最大输出的保守预算，覆盖历史、系统提示、教学材料与工具 schema。不得只用本次用户文本的正常估算作为整段 Prompt 预算；估算失败不得当作 0。
 3. 每一次 Provider attempt（包括 retry、fallback、工具后续调用）必须先提交持久调用 Intent，并按该次模型的上下文上限加输出上限检查/追加预留，提交后才允许调用 Provider。预算不足时不得发起本次模型请求。这一保守策略可能提前拒绝有限额度的短请求；精算优化必须基于完整 Prompt。
+
+调用授权还必须核对当前 Turn 的执行所有权：持有 Turn 行锁，按统一锁顺序取得额度相关锁后，以数据库当前 UTC 时间校验 `running`、`claim_generation`、`claimed_by`、`lease_expires_at`，并校验本地共享 fence；Intent 行锁等待结束后再次校验租约和本地 fence。实际 Provider 派发前再无等待地检查本地 fence，失权拒绝新的调用。该门禁只用于新调用，不能阻止旧 generation 已发生费用的迟到上报或重放。这是派发授权点的检查，不是对外部 Provider 宣称 exactly-once。
+
+数据库准备使用独立的默认 5 秒期限（`preparation_timeout_s`），覆盖连接/行锁等待和准备 SQL；超时退出事务并回滚，分类为 `usage_preparation_timeout`，不得计入 Provider 熔断。期限在 COMMIT 前结束，避免主动取消 COMMIT 导致结果不明；COMMIT 等待也不计入 Provider 期限。流式 Provider 的 total/TTFT 从准备成功后开始。Intent 已提交但确定尚未派发（如本地 fence 撤销或派发前超时）时，以 `estimated` 零用量、`provider_not_dispatched` 结束该 Intent，不制造未知费用；若已经开始迭代/派发，则不得假定零成本。
 4. 锁定用户 quota account，原子检查 `used + reserved + requested <= limit`。
 5. Reservation、Turn、用户消息和 outbox 在同一事务提交。
 6. 额度不足返回 `429 quota_admission_denied`，不创建 Turn。

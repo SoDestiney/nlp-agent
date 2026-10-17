@@ -1,8 +1,28 @@
 # T07 复审修复与验证记录
 
-日期：2026-10-17。状态：已继续修复 `cab9e2b` 的六项 P1，后端异步与前端回归已运行；真实 MySQL 迁移/并发验收和整体验收未完成。
+日期：2026-10-17。状态：已继续修复 `e2b2d75` 复审的调用前所有权 P1 和数据库等待占用流式期限 P2；真实 MySQL 迁移/并发验收和整体验收未完成。
 
-以下旧结果均为历史快照；当前代码与验证状态以“2026-10-17 六项 P1 复审修复”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+以下旧结果均为历史快照；当前代码与验证状态以“2026-10-17 调用前所有权与超时复审修复”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+
+## 2026-10-17 调用前所有权与超时复审修复
+
+基点：`e2b2d75`。仅修复本轮 P1/P2 及同链路的未派发 Intent 计量边界，不修改部署容量，不启动 Docker/MySQL，不推送远端。
+
+- `DurableQuotaUsageReporter.prepare()` 保持 Turn → 全局容量 → Reservation → Account 锁顺序，按数据库当前时间核验 generation、owner、有效 lease、本地 fence 和 running 状态。Intent 锁等待之后再次核验租约/fence，失权不得插入 Intent 或增加 pending。实际流式/非流式 Provider 派发前再检查本地 fence，覆盖准备提交与 telemetry await 之间的本地撤销。该授权点检查不等于外部 Provider exactly-once。
+- 已发生费用的 `report()`/journal replay 不依赖执行 fence，旧 generation 的迟到用量继续幂等入账。
+- 准备 SQL/锁等待默认独立 5 秒期限；超时事务回滚，runtime 分类为 `usage_preparation_timeout`，不经过 Provider 重试/熔断。期限在 COMMIT 前退出，避免主动取消 COMMIT 的不确定性；COMMIT 等待同样不占用 Provider 期限。
+- 流式 total/TTFT 起点移到准备成功之后。确定尚未派发的请求使用 `estimated` 零用量与 `provider_not_dispatched` 结束 Intent，不产生 unknown_usage；已开始 Provider 迭代的请求仍保守记录可能发生的费用。
+
+本轮红绿回归：原代码首先出现 **14 failed / 13 passed**，包含旧所有权仍进入 Provider、准备等待吃掉流式期限及缺少独立期限；随后额外的未派发超时、准备后 fence 撤销、准备超时分类均先失败再修复。
+
+本轮已执行：
+
+- 受影响后端集合重新运行：**181 passed / 6 warnings**。其中 quota reporting **32 项**，覆盖 generation/owner/lease/missing/revoked/wrong-turn、锁等待期间失权、流式/非流式零派发、迟到入账、独立准备超时及不误触 Provider 熔断。没有复用前轮 161 的数字。
+- Ruff、修改文件 compileall、diff whitespace 检查：通过。
+- 真实 MySQL 回归文件：**4 tests collected，未执行**。新增真实行锁/generation 接管后旧 Worker 流式/非流式零派发、旧已发生费用仍可上报；既有取消/迟到/提交失败重放用例补齐真实执行所有权。
+- 项目默认全量后端 `pytest -q --tb=line` 正在运行；结果在本节后补充。`RUN_API_HTTP=0`，真实 HTTP 套件按其现有 opt-in 规则不启动，不把 skip 当验证通过。
+
+仍未验证：真实 MySQL revision 54、RR/行锁/事务回滚、真实 Worker 接管、Redis 暂停/强杀/数据库延迟与负载矩阵。前端没有修改，本轮未重跑前轮 346 项及 typecheck/build，不将旧数字当本轮结果。整个 T07 仍不满足部署条件。
 
 ## 2026-10-17 六项 P1 复审修复
 

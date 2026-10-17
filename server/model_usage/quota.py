@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,9 +90,12 @@ def _event_payload(
 class DurableQuotaUsageReporter:
     """Persist every model attempt before allowing the caller to continue."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, journal_directory: Path | str | None = None) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, journal_directory: Path | str | None = None, preparation_timeout_s: float = 5.0) -> None:
+        if preparation_timeout_s <= 0:
+            raise ValueError("preparation deadline must be positive")
         self._session_factory = session_factory
         self.journal = UsageJournal(journal_directory)
+        self.preparation_timeout_s = preparation_timeout_s
 
     @staticmethod
     async def _lock_capacity(session: AsyncSession) -> None:
@@ -109,6 +112,17 @@ class DurableQuotaUsageReporter:
             TurnModel.id == invocation.attribution.turn_id
         ).with_for_update())
 
+    @staticmethod
+    def check_dispatch(invocation: ModelInvocation) -> None:
+        """No-await local fence check immediately before Provider dispatch."""
+        if invocation.attribution.reservation_id:
+            from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
+
+            fence = current_turn_write_fence()
+            if fence is None:
+                raise LostTurnClaimError(invocation.attribution.turn_id)
+            fence.require_valid(invocation.attribution.turn_id)
+
     async def prepare(self, invocation: ModelInvocation) -> None:
         """Persist a call intent and atomically extend its Turn's token budget."""
         attr = invocation.attribution
@@ -117,7 +131,11 @@ class DurableQuotaUsageReporter:
         if not bound or not output:
             raise ValueError("durable model calls require context and output limits")
         budget = bound + output
-        async with self._session_factory.begin() as session:
+        # This deadline covers pool/row-lock acquisition and preparation SQL,
+        # independently of Provider timeouts. Exit it before committing: a
+        # cancelled preparation rolls back, rather than cancelling a COMMIT
+        # whose outcome could be uncertain. COMMIT is not Provider latency either.
+        async with self._session_factory.begin() as session, asyncio.timeout(self.preparation_timeout_s):
             turn = await self._lock_turn(session, invocation)
             await self._lock_capacity(session)
             reservation = await self._lock_reservation(session, attr.reservation_id)
@@ -137,6 +155,21 @@ class DurableQuotaUsageReporter:
             ).with_for_update())
             if account is None:
                 raise RuntimeError("model quota account disappeared")
+            if attr.reservation_id:
+                from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
+
+                fence = current_turn_write_fence()
+                if fence is None:
+                    raise LostTurnClaimError(attr.turn_id)
+                fence.require_valid(attr.turn_id)
+                # Read server time AFTER waiting for every quota lock. The Turn
+                # remains locked, so generation/owner cannot change underneath us.
+                now = await session.scalar(select(func.utc_timestamp(6)))
+                fence.require_valid(attr.turn_id)
+                if (turn.status != "running" or turn.claim_generation != fence.generation
+                    or turn.claimed_by != fence.worker_id or turn.lease_expires_at is None
+                    or turn.lease_expires_at <= now):
+                    raise LostTurnClaimError(attr.turn_id)
             if reservation is not None:
                 budgets = (await session.scalars(select(ModelUsageIntentModel.reserved_tokens).where(
                     ModelUsageIntentModel.reservation_id == reservation.id,
@@ -146,6 +179,12 @@ class DurableQuotaUsageReporter:
                 limit = account.token_limit if account.token_limit is not None else account.quota_tokens
                 if limit is not None and account.used_tokens + account.reserved_tokens + extra > limit:
                     raise AdmissionLimitError(AdmissionLimitError.MODEL_QUOTA_EXCEEDED)
+                # The locking intent read above can also wait. Recheck lease and
+                # the shared local fence at the last asynchronous boundary.
+                now = await session.scalar(select(func.utc_timestamp(6)))
+                fence.require_valid(attr.turn_id)
+                if turn.lease_expires_at <= now:
+                    raise LostTurnClaimError(attr.turn_id)
                 account.reserved_tokens += extra
                 reservation.reserved_tokens += extra
                 reservation.pending_invocations += 1

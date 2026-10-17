@@ -97,6 +97,9 @@ class ModelFinishReasonError(RuntimeError):
         self.provider = provider
         self.model = model
 
+class UsagePreparationTimeoutError(TimeoutError):
+    """Database admission deadline, not a Provider failure."""
+
 
 class StreamInterruptedError(RuntimeError):
     """A stream failed after externally visible output; transparent replay is unsafe."""
@@ -202,6 +205,9 @@ def _finalize_stream_usage(
 def classify_model_error(error: BaseException) -> ErrorDecision:
     if isinstance(error, (StructuredOutputParseError, OutputParserException)):
         return ErrorDecision(False, "structured_output_parse_error")
+
+    if isinstance(error, UsagePreparationTimeoutError):
+        return ErrorDecision(False, "usage_preparation_timeout")
     if isinstance(error, EmptyModelResponseError):
         return ErrorDecision(True, "upstream_empty_response")
     if isinstance(error, ModelFinishReasonError):
@@ -509,7 +515,25 @@ class ResilientChatModel:
         reporter = self.reporter_slot.reporter if self.reporter_slot is not None else None
         prepare = getattr(reporter, "prepare", None)
         if invocation is not None and prepare is not None:
-            await prepare(invocation)
+            try:
+                await prepare(invocation)
+            except TimeoutError as error:
+                raise UsagePreparationTimeoutError("usage preparation deadline exceeded") from error
+
+    async def _authorize_dispatch(self, invocation: ModelInvocation | None) -> None:
+        reporter = self.reporter_slot.reporter if self.reporter_slot is not None else None
+        check = getattr(reporter, "check_dispatch", None)
+        if invocation is not None and check is not None:
+            try:
+                check(invocation)
+            except Exception as error:
+                # Intent committed, but the local fence was revoked while
+                # starting telemetry/dispatch. No Provider request was sent.
+                await self._report_attempt_guarded(
+                    invocation=invocation, usage=CanonicalTokenUsage(source="estimated"),
+                    status="cancelled", error_kind="provider_not_dispatched",
+                )
+                raise _ReporterFailure(error) from error
 
     def _prepare_invocation(
         self,
@@ -737,6 +761,7 @@ class ResilientChatModel:
                     async with _attempt_span(
                         candidate, attempt, fallback_index, operation_id
                     ) as span:
+                        await self._authorize_dispatch(invocation)
                         response = await asyncio.wait_for(
                             candidate.model.ainvoke(input, config=config, **kwargs),
                             timeout=candidate.preset.timeouts.total_s,
@@ -927,10 +952,10 @@ class ResilientChatModel:
                 )
                 await self._reserve_feature_attempt(invocation)
                 received = False
+                dispatched = False
                 visible = False
                 answer_visible = False
                 first = True
-                started = time.monotonic()
                 latest_usage: CanonicalTokenUsage = CanonicalTokenUsage(
                     source="none"
                 )
@@ -939,6 +964,8 @@ class ResilientChatModel:
                 finish_drain_deadline: float | None = None
                 provider_response_id: str | None = None
                 await self._prepare_usage(invocation)
+                # Admission/DB contention is not Provider latency or TTFT.
+                started = time.monotonic()
                 try:
                     async with _attempt_span(
                         candidate, attempt, fallback_index, operation_id
@@ -971,6 +998,9 @@ class ResilientChatModel:
                                 else candidate.preset.timeouts.stream_idle_s,
                             )
                             try:
+                                if not dispatched:
+                                    await self._authorize_dispatch(invocation)
+                                dispatched = True
                                 chunk = await self._read_stream_chunk(
                                     iterator,
                                     wait_s,
@@ -1082,15 +1112,16 @@ class ResilientChatModel:
                     )
                     await self._report_attempt(
                         invocation=invocation,
-                        usage=partial_usage,
+                        usage=partial_usage if dispatched else CanonicalTokenUsage(source="estimated"),
                         status="cancelled",
                         finish_reason=finish_reason,
+                        error_kind=None if dispatched else "provider_not_dispatched",
                     )
                     raise
                 except BaseException as error:
                     last_error = error
-                    decision = classify_model_error(error)
-                    if decision.kind != "structured_output_parse_error":
+                    decision = classify_model_error(error) if dispatched else ErrorDecision(True, "provider_not_dispatched")
+                    if dispatched and decision.kind != "structured_output_parse_error":
                         candidate.circuit.fail(candidate.preset.circuit_breaker)
                     partial_usage = _finalize_stream_usage(
                         latest_usage,
@@ -1098,7 +1129,9 @@ class ResilientChatModel:
                         provider_response_id,
                         complete=False,
                     )
-                    if partial_usage.source == "none":
+                    if not dispatched:
+                        partial_usage = CanonicalTokenUsage(source="estimated")
+                    elif partial_usage.source == "none":
                         partial_usage = error_canonical_usage(error)
                         if (
                             provider_response_id
