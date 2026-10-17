@@ -44,6 +44,8 @@ def _error_kind_for_turn(error: BaseException) -> str:
         StreamInterruptedError,
         classify_model_error,
     )
+    if isinstance(error, AdmissionLimitError):
+        return error.code
     if isinstance(error, StreamInterruptedError):
         return "stream_interrupted"
     if isinstance(error, ModelRuntimeExhaustedError) and error.__cause__ is not None:
@@ -302,7 +304,7 @@ class InProcessTurnExecutor:
         updated_status = getattr(updated, "status", TurnStatus.FAILED)
         if updated_status == TurnStatus.FAILED:
             error_kind = getattr(updated, "error_kind", None) or (
-                type(fallback_error).__name__
+                _error_kind_for_turn(fallback_error)
                 if fallback_error is not None
                 else "turn_failed"
             )
@@ -550,7 +552,8 @@ class InProcessTurnExecutor:
             workspace_id=task.context.workspace_id,
             conversation_id=task.context.session_id,
             turn_id=task.turn_id,
-            reservation_id=task.quota_reservation_id,
+            reservation_id=task.reservation_id,
+            token_reservation_id=task.quota_reservation_id,
             worker_id=fence.worker_id if fence is not None else None,
             purpose="worker" if fence is not None else "coordinator",
         )

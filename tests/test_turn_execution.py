@@ -11,6 +11,29 @@ from gateway.dispatch import TurnTask
 from gateway.turn_execution import InProcessTurnExecutor, TurnExecutionTimeoutError
 
 
+@pytest.mark.asyncio
+async def test_per_call_quota_denial_preserves_the_public_error_code():
+    class QuotaDeniedEngine(SuccessfulEngine):
+        async def run_turn(self, _context, _turn_id, _content):
+            raise AdmissionLimitError(AdmissionLimitError.MODEL_QUOTA_EXCEEDED)
+
+    repository = FailingLearningRepository()
+    events = []
+
+    async def emit(_turn_id, _session_id, event_type, payload):
+        events.append((event_type, payload))
+
+    task = TurnTask(
+        context=SessionContext(session_id="session-1"), turn_id="turn-1",
+        content="question", learning_context=None, learning_progress=None,
+        exercise_state=None, teaching_materials=TeachingMaterials(),
+        guided_session_id=None, exercise_session_id=None,
+    )
+    await InProcessTurnExecutor(QuotaDeniedEngine(), repository, emit).run(task)
+    assert repository.statuses == [TurnStatus.RUNNING, TurnStatus.FAILED]
+    assert events[-1][1]["error_kind"] == "quota_admission_denied"
+
+
 class SuccessfulEngine:
     async def run_turn(self, _context, _turn_id, _content):
         return 'answer<!-- guided-result: {"status":"completed"} -->'

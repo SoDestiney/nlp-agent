@@ -310,9 +310,6 @@ class RedisWorkerRuntime:
             if processor is not None:
                 self._turn_processors[task.turn_id] = processor
                 owned_turn_id = task.turn_id
-            if await self._call_predicate(self._is_terminal, task):
-                await self._ack(message_id)
-                return 1
             if await self._redis.get(
                 f"{self.config.cancel_key_prefix}{task.turn_id}"
             ):
@@ -322,25 +319,36 @@ class RedisWorkerRuntime:
                     await self._ack(message_id)
                     return 1
                 return 0
+            if await self._call_predicate(self._is_terminal, task):
+                await self._ack(message_id)
+                return 1
 
             start_gate = asyncio.Event()
+            cancel_requested = asyncio.Event()
+            cancel_waiter = asyncio.create_task(cancel_requested.wait())
             future = asyncio.create_task(self._execute_after(start_gate, task))
             heartbeat = asyncio.create_task(
                 self._heartbeat(message_id, task.turn_id)
             )
             self._active[task.turn_id] = future
             self._active_turns[task.turn_id] = task
+            self._cancel_waiters[task.turn_id] = cancel_requested
             try:
                 if await self._redis.get(
                     f"{self.config.cancel_key_prefix}{task.turn_id}"
                 ):
-                    future.cancel()
-                    await asyncio.gather(future, return_exceptions=True)
+                    await self._cancel_and_drain(future)
                     if self._cancel_pending is not None:
                         await self._call(self._cancel_pending, task)
                 else:
                     start_gate.set()
-                    await future
+                    done, _pending = await asyncio.wait({future, cancel_waiter}, return_when=asyncio.FIRST_COMPLETED)
+                    if cancel_waiter in done:
+                        await self._cancel_and_drain(future)
+                        if self._cancel_pending is not None:
+                            await self._call(self._cancel_pending, task)
+                    else:
+                        await future
                 if not await self._is_durable_terminal(task):
                     logger.warning(
                         "Turn execution returned without a durable terminal state; leaving Redis message pending",
@@ -349,6 +357,13 @@ class RedisWorkerRuntime:
                     return 0
                 await self._ack(message_id)
                 return 1
+            except TurnCancellationRequested:
+                if self._cancel_pending is not None:
+                    await self._call(self._cancel_pending, task)
+                if await self._is_durable_terminal(task):
+                    await self._ack(message_id)
+                    return 1
+                return 0
             except asyncio.CancelledError:
                 if task.turn_id not in self._command_cancelled:
                     raise
@@ -360,8 +375,9 @@ class RedisWorkerRuntime:
                 return 0
             finally:
                 if not future.done():
-                    future.cancel()
-                    await asyncio.gather(future, return_exceptions=True)
+                    await self._cancel_and_drain(future)
+                cancel_waiter.cancel()
+                await asyncio.gather(cancel_waiter, return_exceptions=True)
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
                 if self._active.get(task.turn_id) is future:
@@ -371,7 +387,7 @@ class RedisWorkerRuntime:
                     self._command_cancelled.discard(task.turn_id)
         except asyncio.CancelledError:
             raise
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        except (LookupError, TypeError, ValueError, json.JSONDecodeError) as error:
             try:
                 await self._dead_letter(message_id, fields, error)
                 await self._ack(message_id)

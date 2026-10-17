@@ -37,8 +37,8 @@ from server.storage.quota import SyncStorageQuota
 from server.quota.contracts import AdmitTurn
 from server.quota.service import QuotaService, retry_mysql_transaction
 from server.infrastructure.mysql.config import DatabaseConfig
-from server.infrastructure.mysql.sync_engine import configured_engine, release_engine
-from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
+from server.infrastructure.mysql.sync_engine import create_engine, release_engine
+from gateway.execution_fence import LostTurnClaimError, TurnWriteFence, current_turn_write_fence
 
 
 def _now() -> datetime:
@@ -57,7 +57,12 @@ class MySQLGatewayRepository:
         if not url.startswith("mysql+aiomysql://"):
             raise ValueError("MySQL Gateway repository requires mysql+aiomysql DSN")
         from configs.settings import settings
-        self._engine = configured_engine(url, settings.database_runtime)
+        config = database_config or DatabaseConfig.from_runtime({**settings.database_runtime, "url": url}, synchronous=True)
+        self._engine = create_engine(url.replace("mysql+aiomysql://", "mysql+pymysql://"), pool_pre_ping=True,
+            pool_size=config.pool_size, max_overflow=config.max_overflow,
+            pool_timeout=config.pool_timeout_s, pool_recycle=config.pool_recycle_s,
+            connect_args={"connect_timeout": config.connect_timeout_s,
+                "init_command": f"SET SESSION max_execution_time = {config.statement_timeout_s * 1000}"})
         self._runtime_lock_enabled = True
         self.knowledge_point_prompt_budget = max(1, knowledge_point_prompt_budget)
         self.quota_service = QuotaService(self._engine) if quota_enforcement else None
@@ -72,6 +77,33 @@ class MySQLGatewayRepository:
         return runtime_write_transaction(
             self._engine, enabled=getattr(self, "_runtime_lock_enabled", False)
         )
+
+    @staticmethod
+    def _fence_condition(fence: TurnWriteFence | None, *, terminal_event: bool = False) -> tuple[str, dict[str, Any]]:
+        if fence is None:
+            return "", {}
+        fence.require_valid()
+        states = "('running','completed','failed','interrupted')" if terminal_event else "('running')"
+        return (
+            " AND claim_generation=:fence_generation AND claimed_by=:fence_owner"
+            " AND lease_expires_at>UTC_TIMESTAMP(6) AND status IN " + states,
+            {"fence_generation": fence.generation, "fence_owner": fence.worker_id},
+        )
+
+    def _lock_turn_for_write(self, connection: Connection, turn_id: str | None = None, *, terminal_event: bool = False) -> TurnWriteFence | None:
+        fence = current_turn_write_fence()
+        if fence is None:
+            return None
+        fence.require_valid(turn_id)
+        condition, parameters = self._fence_condition(fence, terminal_event=terminal_event)
+        row = connection.execute(
+            text("SELECT id FROM nlp_turns WHERE id=:fence_turn" + condition + " FOR UPDATE"),
+            {"fence_turn": fence.turn_id, **parameters},
+        ).mappings().first()
+        if row is None:
+            fence.revoke()
+            raise LostTurnClaimError(fence.turn_id)
+        return fence
 
     def _row(self, turn_id: str) -> dict[str, Any] | None:
         with self._engine.connect() as c:
@@ -301,6 +333,14 @@ class MySQLGatewayRepository:
                         role_codes=quota_role_codes,
                         classroom_ids=quota_classroom_ids,
                     )
+                active = c.execute(text("SELECT id FROM nlp_turns WHERE conversation_id=:session AND status IN ('accepted','running') ORDER BY created_at DESC LIMIT 1 FOR UPDATE"), {"session": session_id}).mappings().first()
+                if active is not None:
+                    raise TurnConflictError(str(active["id"]))
+                reservation_identity = quota_reservation_id or str(uuid.uuid4())
+                self._lock_turn_capacity(c)
+                self._reserve_model_quota(c, reservation_id=reservation_identity, turn_id=turn_id,
+                    user_id=user_id, workspace_id=workspace_id, reserved_tokens=reserved_tokens,
+                    model_profile=model_profile, default_quota_tokens=getattr(self, "_test_model_quota_tokens", None))
                 state = {"context": learning_context.model_dump(mode="json") if learning_context else None, "progress": learning_progress.model_dump(mode="json") if learning_progress else None, "exercise": exercise_state.model_dump(mode="json") if exercise_state else None}
                 state_json = json.dumps(state, ensure_ascii=False)
                 storage = SyncStorageQuota(c, owner_user_id=user_id)
@@ -313,7 +353,13 @@ class MySQLGatewayRepository:
                     resource_type="turn",
                     resource_key=turn_id,
                 )
-                c.execute(text("INSERT INTO nlp_turns(id,conversation_id,workspace_id,user_id,status,input_text,learning_state_json,idempotency_key) VALUES(:id,:s,:w,:u,'accepted',:input,:state,:key)"), {"id": turn_id, "s": session_id, "w": workspace_id, "u": user_id, "input": input_text, "state": state_json, "key": idempotency_key})
+                try:
+                    c.execute(text("INSERT INTO nlp_turns(id,conversation_id,workspace_id,user_id,status,input_text,learning_state_json,idempotency_key,quota_reservation_id) VALUES(:id,:s,:w,:u,'accepted',:input,:state,:key,:reservation)"), {"id": turn_id, "s": session_id, "w": workspace_id, "u": user_id, "input": input_text, "state": state_json, "key": idempotency_key, "reservation": reservation_identity})
+                except DBAPIError as error:
+                    code = self._admission_limit_code(error)
+                    if code is None:
+                        raise
+                    raise AdmissionLimitError(code) from error
                 message_sequence = int(
                     c.execute(
                         text("SELECT COALESCE(MAX(sequence),0)+1 FROM nlp_conversation_messages WHERE conversation_id=:session"),
@@ -342,10 +388,11 @@ class MySQLGatewayRepository:
             )
         return record, False
 
-    def update_turn(self, turn_id: str, status: TurnStatus, *, final_text=None, error_kind=None, error_message=None, exercise_state=None, dispatch_payload: str | None = None, expected_claim_generation: int | None = None) -> TurnRecord:
+    def update_turn(self, turn_id: str, status: TurnStatus, *, final_text=None, error_kind=None, error_message=None, exercise_state=None, dispatch_payload: str | None = None, expected_claim_generation: int | None = None, quota_reservation_id: str | None = None, reserved_tokens: int = 0, model_profile: str | None = None) -> TurnRecord:
         terminal = status in {TurnStatus.COMPLETED, TurnStatus.FAILED, TurnStatus.CANCELLED, TurnStatus.INTERRUPTED}
         preserve_terminal = False
         with self._runtime_begin() as c:
+            fence = self._lock_turn_for_write(c, turn_id)
             current = c.execute(
                 text("SELECT user_id,result_text,error_message,status,error_kind,claim_generation FROM nlp_turns WHERE id=:id FOR UPDATE"),
                 {"id": turn_id},
@@ -383,7 +430,19 @@ class MySQLGatewayRepository:
                         resource_type="turn_result",
                         resource_key=turn_id,
                     )
-                c.execute(text("UPDATE nlp_turns SET status=:status,result_text=:result,error_kind=:kind,error_message=:message,started_at=CASE WHEN :running='running' THEN UTC_TIMESTAMP(6) ELSE started_at END,completed_at=CASE WHEN :terminal=1 THEN UTC_TIMESTAMP(6) ELSE completed_at END WHERE id=:id"), {"status": status.value, "result": final_text, "kind": error_kind, "message": stored_error, "running": status.value, "terminal": int(terminal), "id": turn_id})
+                if retrying_dispatch_failure:
+                    self._lock_turn_capacity(c)
+                    identity = c.execute(text("SELECT workspace_id,quota_reservation_id FROM nlp_turns WHERE id=:id"), {"id": turn_id}).mappings().one()
+                    quota_reservation_id = quota_reservation_id or identity["quota_reservation_id"]
+                    if quota_reservation_id:
+                        self._reserve_model_quota(c, reservation_id=quota_reservation_id, turn_id=turn_id,
+                            user_id=str(current["user_id"]), workspace_id=str(identity["workspace_id"]), reserved_tokens=reserved_tokens,
+                            model_profile=model_profile, default_quota_tokens=getattr(self, "_test_model_quota_tokens", None))
+                condition, fence_parameters = self._fence_condition(fence)
+                updated = c.execute(text("UPDATE nlp_turns SET status=:status,result_text=:result,error_kind=:kind,error_message=:message,quota_reservation_id=COALESCE(:reservation,quota_reservation_id),started_at=CASE WHEN :running='running' THEN COALESCE(started_at,UTC_TIMESTAMP(6)) ELSE started_at END,completed_at=CASE WHEN :terminal=1 THEN UTC_TIMESTAMP(6) ELSE completed_at END WHERE id=:id" + condition), {"status": status.value, "result": final_text, "kind": error_kind, "message": stored_error, "running": status.value, "terminal": int(terminal), "id": turn_id, "reservation": quota_reservation_id, **fence_parameters})
+                if fence is not None and updated.rowcount != 1:
+                    fence.revoke()
+                    raise LostTurnClaimError(turn_id)
             if not preserve_terminal and dispatch_payload is not None:
                 c.execute(text("INSERT INTO nlp_outbox_messages(id,topic,payload_json,status) VALUES(UUID(),'turn.dispatch',:payload,'pending')"), {"payload": json.dumps({"turn_id": turn_id, "task": dispatch_payload})})
             if storage is not None:
@@ -453,8 +512,10 @@ class MySQLGatewayRepository:
             ).scalar_one_or_none()
         return str(value) if value else None
 
-    def append_event(self, *, turn_id: str, session_id: str, event_type: GatewayEventType, payload=None, expected_claim_generation: int | None = None) -> GatewayEvent:
-        with self._runtime_begin() as c:
+    def append_event(self, *, turn_id: str, session_id: str, event_type: GatewayEventType, payload=None, expected_claim_generation: int | None = None, _connection: Connection | None = None) -> GatewayEvent:
+        with (self._runtime_begin() if _connection is None else nullcontext(_connection)) as c:
+            terminal_event = event_type in {GatewayEventType.TURN_COMPLETED, GatewayEventType.MESSAGE_COMPLETED, GatewayEventType.TURN_FAILED, GatewayEventType.TURN_CANCELLED}
+            fence = self._lock_turn_for_write(c, turn_id, terminal_event=terminal_event)
             current_generation = c.execute(
                 text("SELECT claim_generation FROM nlp_turns WHERE id=:id FOR UPDATE"),
                 {"id": turn_id},
@@ -481,7 +542,11 @@ class MySQLGatewayRepository:
             )
             sequence = int(c.execute(text("SELECT COALESCE(MAX(sequence),0)+1 FROM nlp_turn_events WHERE turn_id=:id"), {"id": turn_id}).scalar_one())
             event_id = str(uuid.uuid4())
-            c.execute(text("INSERT INTO nlp_turn_events(id,turn_id,sequence,claim_generation,event_type,payload_json) VALUES(:event,:turn,:seq,:generation,:type,:payload)"), {"event": event_id, "turn": turn_id, "seq": sequence, "generation": current_generation, "type": event_type.value, "payload": payload_json})
+            condition, parameters = self._fence_condition(fence, terminal_event=terminal_event)
+            inserted = c.execute(text("INSERT INTO nlp_turn_events(id,turn_id,sequence,claim_generation,event_type,payload_json) SELECT :event,id,:seq,claim_generation,:type,:payload FROM nlp_turns WHERE id=:turn" + condition), {"event": event_id, "turn": turn_id, "seq": sequence, "type": event_type.value, "payload": payload_json, **parameters})
+            if fence is not None and inserted.rowcount != 1:
+                fence.revoke()
+                raise LostTurnClaimError(turn_id)
             storage.finalize(storage_reservation, reconcile=True)
         return GatewayEvent(event_id=event_id, turn_id=turn_id, session_id=session_id, sequence=sequence, type=event_type, payload=payload or {})
 

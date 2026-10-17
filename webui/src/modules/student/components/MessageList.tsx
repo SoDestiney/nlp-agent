@@ -89,7 +89,7 @@ const AssistantMessage = memo(function AssistantMessage({ message, showReasoning
             {` · 已等待 ${queueWaitedS} 秒`}
           </div>
         )}
-        {message.status === "failed" ? (
+        {message.status === "failed" && !message.content ? (
           <div className="error-card">这次讲解没有完成，请稍后重试。</div>
         ) : message.status === "cancelled" && !message.content ? (
           <div className="muted-card">已停止生成。</div>

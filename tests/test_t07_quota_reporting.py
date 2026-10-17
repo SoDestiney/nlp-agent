@@ -30,6 +30,25 @@ def outcome():
     return InvocationOutcome(status="succeeded", completed_at=datetime.now(timezone.utc))
 
 
+@pytest.mark.asyncio
+async def test_develop_credit_reporter_keeps_its_reservation_identity(tmp_path):
+    factory, reservation, account, _, _ = ledger()
+    primary = SimpleNamespace(report=AsyncMock(), reserve_feature_usage=AsyncMock())
+    reporter = DurableQuotaUsageReporter(factory, journal_directory=tmp_path, downstream_reporter=primary)
+    original = invocation()
+    call = original.model_copy(update={"attribution": original.attribution.model_copy(update={
+        "reservation_id": "credit-reservation", "token_reservation_id": "reservation",
+    })})
+    await reporter.prepare(call)
+    await reporter.reserve_feature_usage(call)
+    await reporter.report(call, CanonicalTokenUsage(source="provider", input_tokens=10, total_tokens=10), outcome())
+    primary.report.assert_awaited_once()
+    assert primary.report.await_args.args[0].attribution.reservation_id == "credit-reservation"
+    primary.reserve_feature_usage.assert_awaited_once_with(call)
+    assert reservation.pending_invocations == 0
+    assert account.used_tokens == 10
+
+
 @pytest.fixture(autouse=True)
 def execution_fence():
     with bind_turn_write_fence(TurnWriteFence("turn", 1, "worker")):

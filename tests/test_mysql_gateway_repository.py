@@ -303,6 +303,10 @@ def test_create_turn_retries_the_complete_mysql_transaction_after_deadlock() -> 
 
         def __enter__(self):
             connection = MagicMock(name=f"connection-{self.attempt}")
+            connection.execute.return_value.mappings.return_value.first.return_value = None
+            connection.execute.return_value.mappings.return_value.one.return_value = {
+                "token_limit": None, "reserved_tokens": 0, "used_tokens": 0,
+            }
             self.connections.append(connection)
             return connection
 

@@ -513,6 +513,13 @@ def create_app(
             usage_reader = injected_usage_reader
             quota_read_service = injected_quota_read_service
         app.state.quota_usage_reporter = usage_reporter
+        if usage_reporter is not None and gateway.authorization_session_factory is not None:
+            from server.model_usage.quota import DurableQuotaUsageReporter
+            from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+            usage_reporter = DurableQuotaUsageReporter(gateway.authorization_session_factory, downstream_reporter=usage_reporter)
+            configure_global_model_usage_reporter(usage_reporter, required=True)
+            app.state.quota_usage_reporter = usage_reporter
         app.state.quota_usage_reader = usage_reader
         app.state.quota_read_service = quota_read_service
         app.state.quota_management = quota_management

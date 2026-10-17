@@ -99,13 +99,36 @@ def _event_payload(
 class DurableQuotaUsageReporter:
     """Persist every model attempt before allowing the caller to continue."""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, journal_directory: Path | str | None = None, preparation_timeout_s: float = 5.0) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, journal_directory: Path | str | None = None, preparation_timeout_s: float = 5.0, downstream_reporter: Any = None) -> None:
         if preparation_timeout_s <= 0:
             raise ValueError("preparation deadline must be positive")
         self._session_factory = session_factory
         self.journal = UsageJournal(journal_directory)
         self.preparation_timeout_s = preparation_timeout_s
         self._dispatch_permits: dict[str, _DispatchPermit] = {}
+        self._downstream_reporter = downstream_reporter
+
+    def _token_invocation(self, invocation: ModelInvocation) -> ModelInvocation | None:
+        if self._downstream_reporter is None:
+            return invocation
+        token_id = invocation.attribution.token_reservation_id
+        if token_id is None:
+            return None  # Existing feature/background calls remain on Credits.
+        return invocation.model_copy(update={"attribution": invocation.attribution.model_copy(update={"reservation_id": token_id})})
+
+    async def reserve_feature_usage(self, invocation: ModelInvocation) -> None:
+        reserve = getattr(self._downstream_reporter, "reserve_feature_usage", None)
+        if reserve is not None:
+            await reserve(invocation)
+
+    def close(self) -> None:
+        close = getattr(self._downstream_reporter, "close", None)
+        if close is not None:
+            close()
+
+    async def _report_downstream(self, invocation, usage, outcome) -> None:
+        if self._downstream_reporter is not None and outcome.error_kind != "provider_not_dispatched":
+            await self._downstream_reporter.report(invocation, usage, outcome)
 
     @staticmethod
     async def _lock_capacity(session: AsyncSession) -> None:
@@ -124,6 +147,9 @@ class DurableQuotaUsageReporter:
 
     def check_dispatch(self, invocation: ModelInvocation) -> None:
         """No-await local fence check immediately before Provider dispatch."""
+        invocation = self._token_invocation(invocation)
+        if invocation is None:
+            return
         if invocation.attribution.reservation_id:
             from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
 
@@ -136,6 +162,9 @@ class DurableQuotaUsageReporter:
 
     async def prepare(self, invocation: ModelInvocation) -> None:
         """Persist a call intent and atomically extend its Turn's token budget."""
+        invocation = self._token_invocation(invocation)
+        if invocation is None:
+            return
         attr = invocation.attribution
         bound = invocation.identity.context_window_tokens
         output = invocation.identity.max_output_tokens
@@ -219,6 +248,7 @@ class DurableQuotaUsageReporter:
             try:
                 invocation, usage, outcome = await asyncio.to_thread(self.journal.read, path)
                 await self._persist_event(invocation, usage, outcome)
+                await self._report_downstream(invocation, usage, outcome)
                 await asyncio.to_thread(self.journal.acknowledge, path)
                 replayed += 1
             except FileNotFoundError:
@@ -239,6 +269,7 @@ class DurableQuotaUsageReporter:
         # A DB failure leaves both this fact and the pre-call intent pending.
         path = await asyncio.to_thread(self.journal.put, invocation, usage, outcome)
         await self._persist_event(invocation, usage, outcome)
+        await self._report_downstream(invocation, usage, outcome)
         try:
             await asyncio.to_thread(self.journal.acknowledge, path)
         except OSError:
@@ -247,6 +278,9 @@ class DurableQuotaUsageReporter:
             logger.warning("unable to remove acknowledged usage fact %s", path.name, exc_info=True)
 
     async def _persist_event(self, invocation: ModelInvocation, usage: CanonicalTokenUsage, outcome: InvocationOutcome) -> None:
+        invocation = self._token_invocation(invocation)
+        if invocation is None:
+            return
         attribution = invocation.attribution
         user_id = attribution.user_id
         payload = _event_payload(invocation, usage, outcome)

@@ -1,0 +1,34 @@
+# T07 develop 集成交付记录（2026-10-17）
+
+状态：供审查的 Draft PR，不是部署批准。
+
+## 基线与范围
+
+- 分支：`codex/t07-reliability-develop`，从 `origin/develop` 的 `cbbfb6e` 创建。
+- 隔离迁移原 T07 的 10 个提交；未带入原开发分支的 T06 / 文件传输祖先提交。
+- 保留 develop 已有 Credits 额度服务、取消协议、邮件认证、知识本和运行时重置逻辑。
+- T07 token reservation 与已有 Credits reservation 使用不同字段；持久 reporter 组合已有 reporter，不能互相覆盖或混用 reservation ID。
+- T07 迁移接在 develop 的 `20261016_51_t06_phone_identity` 后，单一 head 为 revision 54。
+- Compose 继续保持单 Worker、单执行槽，不宣称双 Worker 已验收。
+
+## 本分支实际执行的检查
+
+- 前端 `npm run typecheck`：通过。
+- 前端 `npm run lint`：通过。
+- 前端 `npm run build`：通过，有大 chunk 提醒。
+- 前端 `npm test -- --exclude src/platform/http/api.integration.test.ts`：76 个文件、601 项通过；明确未执行真实 HTTP 集成文件。
+- 后端核心六文件回归：133 项通过。其后补充额度公开错误码回归并继续运行扩大范围检查，结果见后续补充。
+- `ruff check configs core gateway server tests scripts migrations`、`compileall`、`git diff --check`：通过。
+- 全量后端回归正在执行，已经出现失败/错误；不能称全量门禁通过，也不能未经基线比较就把所有失败归为旧问题。
+
+前端首次沙箱内执行因临时缓存 rename EPERM 没有运行测试；相同命令在沙箱外重跑，得到上述 601 项通过。
+
+## 未验证 / 合并与部署前门槛
+
+- 未在真实 MySQL 执行 revision 54、触发器、回滚、并发额度与 Worker 接管验收。
+- 未完成真实 Redis 暂停、Worker 强杀、数据库延迟、取消竞态及课堂负载矩阵。
+- 缺少本集成分支的真实旧版本负载 baseline/final/comparison，不得把本分支运行结果命名为修复前基线。
+- 后台生命周期、副作用幂等和完整课堂观察仍需逐项审查与验收。
+- 其余 T07 验证文档记录原隔离分支的历史验证，不能作为本 develop 集成分支的复跑结果。
+
+本次交付目标是推送隔离的 T07 分支并创建面向 develop 的 Draft PR；不执行合并，不绕过审查或 CI。

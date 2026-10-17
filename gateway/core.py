@@ -506,7 +506,7 @@ class BackendGateway:
                         reservation_reader, existing.turn_id
                     )
         healthy_workers = getattr(self.dispatcher, "healthy_worker_count", None)
-        if self._remote_execution and healthy_workers is not None:
+        if healthy_workers is not None:
             worker_count = await healthy_workers()
             if worker_count == 0:
                 raise WorkerUnavailableError("no healthy turn workers are available")
@@ -650,7 +650,6 @@ class BackendGateway:
                 idempotency_key=request.idempotency_key or turn_id,
             )
             reservation_id = self.quota_service.reservation_id_for_turn(turn_id)
-        quota_reservation_id = resubmission_reservation_id or str(uuid.uuid4())
         durable_quota = isinstance(self.repository, MySQLGatewayRepository)
         quota_reservation_id = (resubmission_reservation_id or str(uuid.uuid4())) if durable_quota else None
         reserved_tokens = _estimate_turn_reservation_tokens(

@@ -142,6 +142,7 @@ async def run_worker() -> None:
         config.url, channel=config.quota_snapshot_channel
     )
     usage_reporter.set_snapshot_notifier(quota_snapshot_publisher)
+    credit_usage_reporter = usage_reporter
     gateway_config = settings.gateway_runtime
     repository = build_turn_execution_state(gateway_config)
     if getattr(repository, "quota_service", None) is not None:
@@ -286,7 +287,7 @@ async def run_worker() -> None:
     next_capacity_reconcile = time.monotonic() + capacity_reconcile_interval_s
     from server.model_usage.quota import DurableQuotaUsageReporter
 
-    usage_reporter = DurableQuotaUsageReporter(database_runtime.session_factory)
+    usage_reporter = DurableQuotaUsageReporter(database_runtime.session_factory, downstream_reporter=credit_usage_reporter)
     await usage_reporter.replay_pending()
 
     async def relay_forever() -> None:
@@ -341,4 +342,5 @@ async def run_worker() -> None:
             repository.close()
             quota_snapshot_publisher.close()
             await redis.aclose()
+            usage_reporter.close()
             await database_runtime.close()

@@ -208,6 +208,7 @@ async def test_fenced_executor_reports_cancellation_when_heartbeat_sees_durable_
     factory.begin.return_value = unit_of_work
     reliability = AsyncMock()
     reliability.claim_turn.return_value = 1
+    reliability.quota_reservation_for_turn.return_value = "quota-1"
     reliability.heartbeat.return_value = False
     principal = AuthenticatedPrincipal(
         user_id="user-1",

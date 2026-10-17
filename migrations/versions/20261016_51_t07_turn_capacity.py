@@ -6,7 +6,7 @@ from sqlalchemy.dialects import mysql
 
 
 revision = "20261016_51_t07"
-down_revision = "20261016_50_t06"
+down_revision = "20261016_51_t06_phone_identity"
 branch_labels = None
 depends_on = None
 

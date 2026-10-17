@@ -52,7 +52,6 @@ vi.mock("@/platform/http/api", () => ({
   ensureAuth: ensureAuthMock,
   api: {
     listSessions: vi.fn(async () => ({ items: [] })),
-    listTurns: vi.fn(async () => ({ items: [] })),
     getSettings: getSettingsMock,
     createSession: createSessionMock,
     cancelTurn: cancelTurnMock,
