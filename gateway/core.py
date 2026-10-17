@@ -89,35 +89,28 @@ def active_worker_slot_count(workers: list[dict[str, Any]] | None) -> int | None
 
 
 def _estimate_turn_reservation_tokens(content: str, model_profile: str | None) -> int:
-    """Reserve a conservative first-pass input estimate and coordinator output cap."""
+    """Reserve the first call's full context budget, including unseen history/tools.
+
+    The actual prompt is assembled in the Worker. Short user text cannot bound
+    its history, system messages, materials or tool schemas at admission time.
+    Every subsequent Provider attempt obtains its own budget before dispatch.
+    """
     from core.model_runtime.factory import get_global_model_factory
-    from utils.tokens import rough_token_count_estimation
 
     factory = get_global_model_factory()
     profile = model_profile or factory.config.default_model_profile
     if profile:
         preset_names = (factory.profile_preset(profile, "coordinator"),)
-        estimated_input = factory.estimate_input_tokens(
-            profile, [{"role": "user", "content": content}]
-        )
     else:
         candidates = factory.config.route_presets("coordinator")
         preset_names = tuple(name for name, _preset in candidates)
-        estimated_input = rough_token_count_estimation(
-            [{"role": "user", "content": content}]
-        )
-    if estimated_input is None:
-        context_limits = [
-            factory.config.models[
-                factory.config.model_presets[name].model
-            ].context_window_tokens
-            for name in preset_names
-        ]
-        if not context_limits:
-            raise RuntimeError("coordinator route has no model context limit")
-        # A failed estimator must not quietly fall back to a much smaller
-        # character heuristic: reserve the largest eligible input context.
-        estimated_input = max(context_limits)
+    context_limits = [
+        factory.config.models[factory.config.model_presets[name].model].context_window_tokens
+        for name in preset_names
+    ]
+    if not context_limits:
+        raise RuntimeError("coordinator route has no model context limit")
+    estimated_input = max(context_limits)
     output_reserve = max(
         factory.config.model_presets[name].generation.max_output_tokens
         for name in preset_names
@@ -658,9 +651,11 @@ class BackendGateway:
             )
             reservation_id = self.quota_service.reservation_id_for_turn(turn_id)
         quota_reservation_id = resubmission_reservation_id or str(uuid.uuid4())
+        durable_quota = isinstance(self.repository, MySQLGatewayRepository)
+        quota_reservation_id = (resubmission_reservation_id or str(uuid.uuid4())) if durable_quota else None
         reserved_tokens = _estimate_turn_reservation_tokens(
             enriched_content, request.model_profile
-        )
+        ) if durable_quota else 0
         task = TurnTask(
             context=context,
             turn_id=turn_id,

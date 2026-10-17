@@ -671,6 +671,7 @@ class ModelQuotaReservationModel(Base):
     reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
     used_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     settled_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    pending_invocations: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, server_default="0")
     unknown_usage_events: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="reserved")
     created_at: Mapped[datetime] = mapped_column(
@@ -678,6 +679,20 @@ class ModelQuotaReservationModel(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     finalized_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+
+
+class ModelUsageIntentModel(Base):
+    __tablename__ = "nlp_model_usage_intents"
+    __table_args__ = (Index("ix_nlp_model_usage_intents_reservation", "reservation_id", "status"),)
+    operation_id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    reservation_id: Mapped[str | None] = mapped_column(
+        UUID, ForeignKey("nlp_model_quota_reservations.id", ondelete="RESTRICT")
+    )
+    user_id: Mapped[str] = mapped_column(UUID, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    invocation_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, server_default=func.utc_timestamp(6))
 
 
 class ModelUsageEventModel(Base):

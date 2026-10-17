@@ -6,7 +6,7 @@
 >
 > 目标读者：负责实现、压测、故障注入和交付的开发 Agent
 >
-> 最后核对日期：2026-10-15
+> 最后核对日期：2026-10-17
 
 ## 0. 实施与验收状态（更新于 2026-10-17）
 
@@ -376,8 +376,8 @@ nlp_model_usage_events
 创建 Turn 前：
 
 1. 解析实际 model profile 和 role。
-2. 使用 ModelFactory 估算输入 token；估算为 `None` 时按明确的最大风险值预留，不得当作 0。
-3. 预留量至少覆盖估算输入加配置的最大输出。
+2. 完整 Prompt 在 Worker 组装，接单阶段采用所选 coordinator 模型最大输入上下文加最大输出的保守预算，覆盖历史、系统提示、教学材料与工具 schema。不得只用本次用户文本的正常估算作为整段 Prompt 预算；估算失败不得当作 0。
+3. 每一次 Provider attempt（包括 retry、fallback、工具后续调用）必须先提交持久调用 Intent，并按该次模型的上下文上限加输出上限检查/追加预留，提交后才允许调用 Provider。预算不足时不得发起本次模型请求。这一保守策略可能提前拒绝有限额度的短请求；精算优化必须基于完整 Prompt。
 4. 锁定用户 quota account，原子检查 `used + reserved + requested <= limit`。
 5. Reservation、Turn、用户消息和 outbox 在同一事务提交。
 6. 额度不足返回 `429 quota_admission_denied`，不创建 Turn。
@@ -399,11 +399,20 @@ nlp_model_usage_events
 - retry/fallback 的每次真实调用都计入实际使用。
 - `source="none"` 不得视为精确零成本，必须标记待对账。
 
+新增 `nlp_model_usage_intents`，以 operation ID 为主键，保存 reservation/user、调用预算、完整 invocation 身份及 pending/reported/unknown_usage 状态；Reservation 增加 `pending_invocations`。每次 Provider 调用之前，Intent 和预算追加同事务提交。已知 usage 入账时从尚未使用的 Reservation 移出对应金额，避免 `used` 与 `reserved` 双重占用同一笔已知成本。
+
+Provider 返回后的精确 usage 先写入持久 `.data/model-usage-outbox`，文件 fsync 后原子发布，再尝试 MySQL Usage Event 事务；事务成功后才删除文件。Worker 启动、运行中和关闭排空后重放此 outbox，重复 operation ID 不重复扣减。所有生产 Worker 必须挂载并保留共享 `.data` 卷；不能把待补报文件放在临时层。
+
+数据库使用统一的短事务锁顺序：Turn（如涉及）→ `global:turns` 容量锁 → Reservation → Account。对账候选查询仅作提示；逐项释放使用新的锁定读取。余额汇总在独立事务取得同一容量锁，再用 Reservation `FOR UPDATE` 当前读汇总，最后锁 Account 修正，禁止用旧 REPEATABLE READ 快照覆盖当前余额。
+
 终态规则：
 
-- completed/failed/cancelled：结算已发生 usage，释放剩余 Reservation。
+- completed/failed/cancelled：结算已发生 usage；仅在 pending Intent 已处理且无未知用量后释放剩余 Reservation。Reporter 事务失败、磁盘不可写或 Provider 中途消失时，持久 Intent 保留对应额度并暴露待对账指标，不能因 Turn 终态释放。只有 Intent、没有精确返回事实时，须人工/Provider 对账，不能伪造零成本自动释放；生产告警接入仍按未完成清单推进。
+- 取消后迟到的已知 usage 必须同时更新 `used_tokens` 与 `settled_tokens`；仍持有 pending 额度的终态 Turn，在最后一笔报告完成时结算释放。
 - interrupted 且将恢复：保留 Reservation；最终终态才释放。
-- Reservation 过期且 Turn 已终态或不存在：reconciler 释放并告警。
+- Reservation 过期且 Turn 已终态或不存在：仅在无 pending/unknown usage 时允许 reconciler 释放并告警。
+
+Worker 退出时必须先排空/取消执行和相关计量，再重放待补报事实，最后卸载 Reporter；调用关闭协程的任务被取消不能中断这一排空顺序。Revision `20261017_54_t07` 上线前先排空旧 Worker，避免无 Intent 的旧调用混跑；降级前必须处理 pending/unknown_usage Intent，迁移不得删除待补报事实。
 
 ### 10.5 错误区分
 

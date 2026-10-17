@@ -16,6 +16,7 @@ import { useTurnHistory } from "../internal/turn-history";
 
 export function useStudentWorkspace() {
   const globalAuth = useOptionalAuth();
+  const refreshAuthSession = globalAuth?.refreshSession;
   const {
     preferences,
     preferencesRef,
@@ -145,11 +146,12 @@ export function useStudentWorkspace() {
     const socket = new StudentSocket(
       handleEvent,
       setSocketStatus,
+      undefined,
       async () => {
+        await refreshAuthSession?.();
         const sessionId = activeSessionRef.current;
         if (sessionId) await loadTurns(sessionId);
       },
-      globalAuth?.refreshSession,
     );
     socketRef.current = socket;
     socket.setSession(activeSessionRef.current);
@@ -159,7 +161,7 @@ export function useStudentWorkspace() {
       socket.close();
       socketRef.current = null;
     };
-  }, [activeSessionRef, bootStatus, globalAuth?.refreshSession, handleEvent, loadTurns]);
+  }, [activeSessionRef, bootStatus, refreshAuthSession, handleEvent, loadTurns]);
 
   useEffect(() => {
     // AuthProvider is the single global 401 boundary. If a request made by

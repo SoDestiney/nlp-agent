@@ -10,7 +10,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from gateway.contracts import GatewayEventType, TurnStatus
+from gateway.contracts import AdmissionLimitError, GatewayEventType, TurnStatus
 from core.agent_runtime import configured_budget
 from core.vision_execution import attached_image_names, bind_image_turn, image_turn_timeout
 from core.rbac import Permission

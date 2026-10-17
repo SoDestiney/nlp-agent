@@ -89,6 +89,36 @@ def create_worker_quota_reaper(
     )
 
 
+async def close_worker_execution(worker, engine, usage_reporter) -> None:
+    """Keep metering installed until execution and cancellation have drained."""
+    from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+    async def drain():
+        try:
+            try:
+                await worker.close()
+            finally:
+                await engine.close()
+        finally:
+            await usage_reporter.replay_pending()
+
+    task = asyncio.create_task(drain(), name="worker-usage-drain")
+    cancelled = False
+    try:
+        while True:
+            try:
+                await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancelled = True
+    finally:
+        configure_global_model_usage_reporter(None)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def run_worker() -> None:
     from redis.asyncio import Redis
     from server.quota.bootstrap import (
@@ -254,12 +284,17 @@ async def run_worker() -> None:
         5, settings.NLP_AGENT_TURN_CAPACITY_RECONCILE_INTERVAL_S
     )
     next_capacity_reconcile = time.monotonic() + capacity_reconcile_interval_s
+    from server.model_usage.quota import DurableQuotaUsageReporter
+
+    usage_reporter = DurableQuotaUsageReporter(database_runtime.session_factory)
+    await usage_reporter.replay_pending()
 
     async def relay_forever() -> None:
         nonlocal next_capacity_reconcile
         relay = OutboxRelay(redis, stream=config.task_stream, relay_id=worker_id, authorization_channel=config.authorization_channel)
         while True:
             try:
+                await usage_reporter.replay_pending()
                 if time.monotonic() >= next_capacity_reconcile:
                     next_capacity_reconcile = time.monotonic() + capacity_reconcile_interval_s
                     await asyncio.to_thread(repository.reconcile_capacity)
@@ -284,30 +319,26 @@ async def run_worker() -> None:
     usage_reporter_configured = False
     try:
         from core.model_runtime.reporters import configure_global_model_usage_reporter
-        from server.model_usage.quota import DurableQuotaUsageReporter
-
-        configure_global_model_usage_reporter(
-            DurableQuotaUsageReporter(database_runtime.session_factory)
-        )
+        configure_global_model_usage_reporter(usage_reporter)
         usage_reporter_configured = True
         await worker.run_forever()
     finally:
-        if usage_reporter_configured:
-            from core.model_runtime.reporters import configure_global_model_usage_reporter
-
-            configure_global_model_usage_reporter(None)
         relay_task.cancel()
         summary_sweep_task.cancel()
         await asyncio.gather(relay_task, summary_sweep_task, return_exceptions=True)
         if quota_reaper is not None:
             await quota_reaper.stop()
-        await worker.close()
-        await engine.close()
-        await sandbox_model_service.close()
-        if sandbox_manager is not None:
-            await sandbox_manager.close()
-        repository.close()
-        quota_snapshot_publisher.close()
-        await redis.aclose()
-        shutdown_usage_reporter(usage_reporter)
-        await database_runtime.close()
+        try:
+            if usage_reporter_configured:
+                await close_worker_execution(worker, engine, usage_reporter)
+            else:
+                await worker.close()
+                await engine.close()
+        finally:
+            await sandbox_model_service.close()
+            if sandbox_manager is not None:
+                await sandbox_manager.close()
+            repository.close()
+            quota_snapshot_publisher.close()
+            await redis.aclose()
+            await database_runtime.close()

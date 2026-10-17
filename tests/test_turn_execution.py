@@ -6,7 +6,7 @@ import pytest
 
 from core.learning import TeachingMaterials
 from core.session_context import SessionContext
-from gateway.contracts import GatewayEventType, TurnStatus
+from gateway.contracts import AdmissionLimitError, GatewayEventType, TurnStatus
 from gateway.dispatch import TurnTask
 from gateway.turn_execution import InProcessTurnExecutor, TurnExecutionTimeoutError
 

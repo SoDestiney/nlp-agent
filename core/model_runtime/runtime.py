@@ -504,6 +504,12 @@ class ResilientChatModel:
                 )
             return
         await reserve(invocation)
+    async def _prepare_usage(self, invocation: ModelInvocation | None) -> None:
+        """Authorize and persist each attempt before any Provider side effect."""
+        reporter = self.reporter_slot.reporter if self.reporter_slot is not None else None
+        prepare = getattr(reporter, "prepare", None)
+        if invocation is not None and prepare is not None:
+            await prepare(invocation)
 
     def _prepare_invocation(
         self,
@@ -726,6 +732,7 @@ class ResilientChatModel:
                 await self._reserve_feature_attempt(invocation)
                 attempt_reported = False
                 terminal_error: ModelFinishReasonError | None = None
+                await self._prepare_usage(invocation)
                 try:
                     async with _attempt_span(
                         candidate, attempt, fallback_index, operation_id
@@ -931,6 +938,7 @@ class ResilientChatModel:
                 finish_reason: str | None = None
                 finish_drain_deadline: float | None = None
                 provider_response_id: str | None = None
+                await self._prepare_usage(invocation)
                 try:
                     async with _attempt_span(
                         candidate, attempt, fallback_index, operation_id

@@ -192,6 +192,7 @@ def test_ensure_conversation_rejects_an_identity_collision() -> None:
 
 def test_create_turn_ensures_the_conversation_before_inserting_the_turn() -> None:
     repository = object.__new__(MySQLGatewayRepository)
+    repository._test_model_quota_tokens = None
     engine = MagicMock()
     connection = engine.begin.return_value.__enter__.return_value
     no_active_turn = MagicMock()
@@ -201,6 +202,7 @@ def test_create_turn_ensures_the_conversation_before_inserting_the_turn() -> Non
 
     with (
         patch.object(MySQLGatewayRepository, "_ensure_conversation") as ensure,
+        patch.object(MySQLGatewayRepository, "_reserve_model_quota"),
         patch.object(MySQLGatewayRepository, "_row", return_value={"id": "turn-1"}),
         patch.object(MySQLGatewayRepository, "_record", return_value=sentinel.record),
         patch("gateway.mysql_repository.SyncStorageQuota") as quota_type,

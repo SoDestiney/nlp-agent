@@ -1184,7 +1184,8 @@ class MySQLGatewayRepository:
                         "SELECT COUNT(*) FROM nlp_model_quota_reservations r "
                         "LEFT JOIN nlp_turns t ON t.id=r.turn_id "
                         "WHERE r.status='reserved' AND "
-                        "(t.id IS NULL OR t.status NOT IN ('accepted','running'))"
+                        "(t.id IS NULL OR t.status NOT IN ('accepted','running')) "
+                        "AND r.pending_invocations=0 AND r.unknown_usage_events=0"
                     )
                 ).scalar_one()
             )
@@ -1196,6 +1197,10 @@ class MySQLGatewayRepository:
                     )
                 ).scalar_one()
             )
+            pending_usage = int(connection.execute(text(
+                "SELECT COUNT(*) FROM nlp_model_usage_intents "
+                "WHERE status IN ('pending','unknown_usage')"
+            )).scalar_one())
             recoveries_1h = int(
                 connection.execute(
                     text(
@@ -1213,6 +1218,7 @@ class MySQLGatewayRepository:
                 "reserved_tokens": int(quota["reserved_tokens"]),
                 "unknown_usage_events": int(quota["unknown_usage_events"]),
                 "leaked_reservations": quota_leaks,
+                "pending_usage_intents": pending_usage,
             },
             "database_sync_pool": {
                 "size": int(pool.size()),
@@ -1228,32 +1234,36 @@ class MySQLGatewayRepository:
         """Release reservations whose durable Turn is already terminal or gone.
 
         Lock ordering mirrors Turn settlement and usage reporting:
-        Turn -> Reservation -> Account. Account counters are then checked
+        Turn -> global capacity mutex -> Reservation -> Account. Counters are checked
         against the reservation rows, never silently clamped.
         """
         released = 0
-        with self._engine.begin() as connection:
+        with self._engine.connect() as connection:
             candidates = connection.execute(
                 text(
                     "SELECT id,turn_id FROM nlp_model_quota_reservations "
                     "WHERE status='reserved' ORDER BY created_at,id"
                 )
             ).mappings().all()
-            for candidate in candidates:
+        for candidate in candidates:
+            with self._engine.begin() as connection:
                 turn = connection.execute(
                     text("SELECT status FROM nlp_turns WHERE id=:turn FOR UPDATE"),
                     {"turn": candidate["turn_id"]},
                 ).mappings().first()
                 if turn is not None and turn["status"] in {"accepted", "running"}:
                     continue
+                self._lock_turn_capacity(connection)
                 reservation = connection.execute(
                     text(
-                        "SELECT id,user_id,reserved_tokens,unknown_usage_events,status "
+                        "SELECT id,user_id,reserved_tokens,unknown_usage_events,pending_invocations,status "
                         "FROM nlp_model_quota_reservations WHERE id=:id FOR UPDATE"
                     ),
                     {"id": candidate["id"]},
                 ).mappings().first()
                 if reservation is None or reservation["status"] != "reserved":
+                    continue
+                if int(reservation["pending_invocations"]) or int(reservation["unknown_usage_events"]):
                     continue
                 account = connection.execute(
                     text(
@@ -1272,11 +1282,7 @@ class MySQLGatewayRepository:
                     ),
                     {"tokens": amount, "user": reservation["user_id"]},
                 )
-                final_status = (
-                    "unknown_usage"
-                    if int(reservation["unknown_usage_events"]) > 0
-                    else ("settled" if turn is not None else "released")
-                )
+                final_status = "settled" if turn is not None else "released"
                 connection.execute(
                     text(
                         "UPDATE nlp_model_quota_reservations SET status=:status, "
@@ -1287,16 +1293,21 @@ class MySQLGatewayRepository:
                 )
                 released += 1
 
-            actual = {
-                str(row["user_id"]): int(row["reserved_tokens"])
-                for row in connection.execute(
-                    text(
-                        "SELECT user_id,SUM(reserved_tokens) AS reserved_tokens "
-                        "FROM nlp_model_quota_reservations WHERE status='reserved' "
-                        "GROUP BY user_id"
-                    )
-                ).mappings()
-            }
+        # A separate transaction avoids reusing the candidates' REPEATABLE READ
+        # snapshot. Admission and terminal triggers take this same mutex before
+        # changing reservations/account counters. Read reservation rows with a
+        # locking (current) read, never a snapshot aggregate followed by a write.
+        with self._engine.begin() as connection:
+            self._lock_turn_capacity(connection)
+            actual: dict[str, int] = {}
+            for row in connection.execute(
+                text(
+                    "SELECT user_id,reserved_tokens FROM nlp_model_quota_reservations "
+                    "WHERE status='reserved' ORDER BY user_id,id FOR UPDATE"
+                )
+            ).mappings():
+                user = str(row["user_id"])
+                actual[user] = actual.get(user, 0) + int(row["reserved_tokens"])
             accounts = connection.execute(
                 text(
                     "SELECT user_id,reserved_tokens FROM nlp_model_quota_accounts "

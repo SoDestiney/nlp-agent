@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from unittest.mock import patch
+import pytest
 
 from gateway.contracts import AdmissionLimitError
 from gateway.core import _estimate_turn_reservation_tokens
@@ -28,7 +29,8 @@ def test_model_quota_limit_uses_the_stable_public_problem_code():
     assert AdmissionLimitError.MODEL_QUOTA_EXCEEDED == "quota_admission_denied"
 
 
-def test_reservation_estimator_uses_model_context_limit_when_estimation_fails():
+@pytest.mark.parametrize("estimated", [None, 1, 100])
+def test_reservation_covers_full_prompt_even_when_current_text_estimate_is_small(estimated):
     factory = SimpleNamespace(
         config=SimpleNamespace(
             default_model_profile="classroom",
@@ -40,7 +42,7 @@ def test_reservation_estimator_uses_model_context_limit_when_estimation_fails():
             models={"large-context": SimpleNamespace(context_window_tokens=32_000)},
         ),
         profile_preset=lambda _profile, _role: "coordinator",
-        estimate_input_tokens=lambda _profile, _messages: None,
+        estimate_input_tokens=lambda _profile, _messages: estimated,
     )
 
     with patch("core.model_runtime.factory.get_global_model_factory", return_value=factory):

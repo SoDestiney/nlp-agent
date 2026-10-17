@@ -1,8 +1,36 @@
 # T07 复审修复与验证记录
 
-日期：2026-10-17。状态：开发侧已继续补齐接单/额度账本审查缺口；T07 整体验收未完成，不可据此部署。
+日期：2026-10-17。状态：已继续修复 `cab9e2b` 的六项 P1，后端异步与前端回归已运行；真实 MySQL 迁移/并发验收和整体验收未完成。
 
-以下旧结果均为历史快照；当前代码与验证状态以“2026-10-17 复审缺口续修”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+以下旧结果均为历史快照；当前代码与验证状态以“2026-10-17 六项 P1 复审修复”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+
+## 2026-10-17 六项 P1 复审修复
+
+基点：`cab9e2b`。范围是本轮明确列出的票据接线、对账并发、关闭排空、待补报事实、迟到用量和每次模型调用的预算保护。
+
+1. `StudentSocket` 第三个参数保留默认 ticket provider；第四个 onReady 依次刷新身份、恢复当前历史。Socket 等待恢复成功后才订阅/重放/发送排队命令；关闭或替换的连接不能晚到后恢复。额外修正同一链路的 `RealtimeRequestError` 类型传递和错误展示。流式状态事件直接更新本地消息，避免同时刷新旧 HTTP 快照覆盖新文本；重连与 gap 仍恢复历史。
+2. quota reconciler 将候选读取、逐笔释放和余额汇总分成独立短事务。释放与 Reporter 使用 Turn → 全局容量锁 → Reservation → Account；汇总先取得同一全局容量锁，再用 `FOR UPDATE` 当前读 Reservation 明细，最后锁账户修正，避免 REPEATABLE READ 旧快照覆盖新接单预留。
+3. Worker 关闭先排空 worker、engine 和 usage replay，最后卸载 Reporter；关闭调用者被取消时仍等待这一排空过程。Provider 完成/取消时的报告保持可用。
+4. 新增 revision `20261017_54_t07`：`nlp_model_usage_intents` 和 Reservation 的 `pending_invocations`。每次 Provider attempt 前持久化 Intent、检查/追加预算；未完成计量的 Intent 阻止终态触发器和 reconciler 释放额度。精确结果先写 fsync 后原子发布的 `.data/model-usage-outbox`，再入 MySQL；DB 事务失败保留文件，Worker 启动/周期/排空后重放，operation ID 幂等。DB 已提交但本地文件删除失败时保留冗余文件重放，不使成功 Turn 因清理失败转为失败。
+5. 迟到已知 usage 同步更新 `used_tokens` 和 `settled_tokens`；最后一笔 pending 报告完成后结算终态 Turn。`source=none` 保留预算和待对账指标，不伪造零成本。只剩 Intent、没有精确返回事实的异常调用仍需人工/Provider 对账。
+6. 接单按 coordinator 的完整上下文上限加最大输出保守预留；后续每次 retry/fallback/工具调用在 Provider 前检查该次模型预算。已知 usage 从未使用的预留移入 used，避免双重占用。后续调用额度不足保持稳定的 `quota_admission_denied`。测试用 SQLite 仓库同步了接口参数兼容，生产 MySQL 额度路径保持强制保护。
+
+持久性/部署约束：所有 Worker 必须挂载保留共享 `.data` 卷；旧 Worker 必须先排空再执行 revision 54，不能与无 Intent 的旧调用混跑。降级有 pending/unknown_usage Intent 时会拒绝执行，避免删除待补报事实。Compose 仍为 1×1。
+
+### 本轮已执行
+
+- 受影响后端测试集合：**161 passed**，包含模型 usage/Provider 合同、quota reporting、admission、Gateway、worker fence/shutdown、迁移图和真实 ASGI TestClient WebSocket 关闭回归；没有再用 `not asyncio` 排除异步用例。连续 100 次 TestClient 连接/订阅失败/ping/断开也通过。
+- Windows socketpair 阻塞通过沙箱外测试进程排除：相同 Python asyncio 初始化在沙箱外成功，随后执行上述异步测试。这纠正了前轮将本机异步回归长期视为不可运行的验证边界。
+- 前端 typecheck、修改文件 ESLint、production build：通过。前端 unit/component：**55 files / 346 passed**，命令为 `npm test -- --exclude src/platform/http/api.integration.test.ts`，仅明确排除真实后端集成文件。
+- Ruff 全后端目录、compileall、迁移图与 revision 53→54 的 offline SQL 生成：通过。唯一 head 为 `20261017_54_t07`。offline SQL 生成不是在 MySQL 执行迁移。
+- 新增真实 MySQL 回归 `tests/api_http/chat/test_t07_quota_review_core.py`：**3 tests collected，未执行**。覆盖候选旧快照与接单交错、取消后迟到 usage、report 事务 commit 失败后 Turn failed、保留预留及新 Reporter 重放、重复计量与后续调用额度拒绝。
+
+### 当前门禁与未验证
+
+- 没有启动 Docker 或真实 MySQL；新迁移、RR 行锁语义、触发器 rollback、真实学生浏览器页面连接和三项 MySQL 回归均未验证，不计为通过。
+- 全量前端 `npm test` 首次失败包含真实 FastAPI 集成套件选中了缺 SQLAlchemy 的系统 Python。该套件应配置 `PRO_NLP_PYTHON=E:/Github/Pro_NLP/.venv/Scripts/python.exe` 并使用已迁移的隔离 MySQL；本轮没有执行真实后端套件。另两项流式测试暴露的旧 HTTP 快照覆盖实时文本已修复，随后 346 项前端 unit/component 全部通过。
+- 全量前端 lint 仍为红：7 errors / 1 warning，位于未修改的 `AccountDialog.tsx`、`FilesPanel.tsx`、`MarkdownContent.tsx`、`ExcalidrawAdapter.tsx`、`WhiteboardLibraryManager.tsx`、`TeacherBookEditor.tsx`。本轮修改文件 lint 通过；未放宽规则或将此项归因于数据库环境。
+- 全量后端、冻结旧版本 50/30、故障矩阵、后台持久生命周期及副作用幂等仍需后续完成。此次限定修复和测试结果不足以标记整个 T07 完成或部署就绪。
 
 ## 历史记录：2026-10-17 首轮开发侧补齐
 
@@ -23,7 +51,7 @@
 - 异步 Worker fence 测试在 Windows 测试运行器创建 asyncio event loop 时卡于系统 socketpair 初始化，已中断；不计作通过。前端测试/类型检查依赖在该隔离工作区不完整，未运行。
 - 本轮未启动 Docker、MySQL、Redis、Provider 或真实课堂负载；未生成新的 baseline/final/comparison，也未修改 Compose 扩容配置。
 
-## 2026-10-17 复审缺口续修
+## 历史记录：2026-10-17 复审缺口续修
 
 本轮继续处理已提交开发代码的复审项，没有启动 Docker：
 
@@ -228,12 +256,12 @@ python -m pytest tests/api_http/auth/test_registration_core.py tests/api_http/au
 
 ## 未完成与未验证
 
-1. Admission 计数、额度 Reservation/Usage ledger、终态释放与 `20261017_53_t07` 均已实现代码，但本轮没有在真实 MySQL 执行迁移或集成验证；静态检查和单测不能证明 SQL 并发语义、触发器回滚或容量计数无漂移。
+1. Admission 计数、额度 Reservation/Usage ledger、Intent/终态释放与 `20261017_54_t07` 均已实现代码，但本轮没有在真实 MySQL 执行迁移或集成验证；静态检查和单测不能证明 SQL 并发语义、触发器回滚或容量计数无漂移。
 2. 后台 Worker 目前在 fenced Turn 中禁止脱离式运行，但尚无独立持久任务表、接单/lease/取消/终态及恢复链路。工具副作用也尚未全面绑定持久 operation ID 与 generation，因此不满足双 Worker 的 exactly-once 启用前提。
 3. 指标已提供 pool 使用量、pending checkout、acquire latency 固定桶/最大值/超时，以及队列/执行槽/恢复/额度状态；尚未在真实 MySQL 上验证采集表现，也未补 statement/lock/deadlock 指标和生产监控告警接入。
-4. 前端排队显示/取消/重连恢复已实现代码，但本轮没有可用完整的前端依赖目录，未运行类型检查、测试或 build。
+4. 前端 typecheck、修改文件 lint/build 及 346 项 unit/component 已通过；真实 FastAPI/MySQL 集成和学生浏览器连接未验证。全量前端 lint 仍有范围外 7 errors / 1 warning。
 5. 尚无冻结旧版本 50 登录/30 Turn 基线、同参 final/comparison、`1×1 → 1×4 → 2×4`、Worker 强杀、Redis pause、DB delay、慢短信、额度耗尽和 Provider 错误完整故障矩阵结果。
-6. 本地 pytest 的异步用例受 Windows 事件循环 socketpair 初始化阻塞；真实数据库/HTTP 测试尚未运行。历史全量回归曾有 36 项在冻结版本复现的旧失败，另外存在过时记录的偶发项；需按当前代码重新采集全量结果。
+6. 沙箱外执行已恢复 Windows 异步测试，本轮受影响后端 161 项通过；真实 MySQL/HTTP 集成和全量后端尚未运行。历史全量失败快照仍需按当前代码重新采集，不能以定向通过替代。
 7. 因上述实现/验证缺口，T07 仍不可部署或扩容。Compose 继续保持 1×1；不得把未运行的迁移、前端或真实负载验证描述为通过。
 
-下一阶段先补独立后台任务 lease/取消/恢复与副作用幂等 fence，再补 statement/lock/deadlock 指标及告警；随后需要恢复可运行的 Windows 测试事件循环并执行新迁移、真实数据库并发与故障注入验收。在此之前 Compose 保持 1×1，不扩容生产。
+下一阶段先在可用隔离 MySQL 执行 revision 54 和本轮三项并发/计量回归；再补独立后台任务 lease/取消/恢复与副作用幂等 fence、statement/lock/deadlock 指标及告警，并执行负载与故障验收。在此之前 Compose 保持 1×1。

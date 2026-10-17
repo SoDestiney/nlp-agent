@@ -62,6 +62,7 @@ TABLE_COMMENTS: dict[str, str] = {
     "nlp_model_quota_accounts": "用户模型 Token 额度账户及累计预留、消耗和未知用量。",
     "nlp_model_quota_reservations": "Turn 提交时创建并在终态结算的模型 Token 预留。",
     "nlp_model_usage_events": "按 Provider Attempt 幂等保存的模型用量事实。",
+    "nlp_model_usage_intents": "模型调用前持久化的预算及待上报状态，未完成计量时保留额度。",
     "nlp_conversation_messages": "对话消息的有序持久化内容。",
     "nlp_turn_events": "执行轮次的顺序事件和事件载荷。",
     "nlp_exercise_sessions": "用户练习会话及蓝图快照。",
