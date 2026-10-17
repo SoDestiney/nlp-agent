@@ -20,7 +20,8 @@
 - 最终代码受影响后端集合重新运行：**183 passed / 6 warnings**。其中 quota reporting **34 项**，覆盖 generation/owner/lease/missing/revoked/wrong-turn、锁等待期间失权、COMMIT 跨租约、流式/非流式零派发、迟到入账、独立准备超时及不误触 Provider 熔断。COMMIT 跨租约的两项用例也先失败再修复，没有复用前轮 161 的数字。
 - Ruff、修改文件 compileall、diff whitespace 检查：通过。
 - 真实 MySQL 回归文件：**4 tests collected，未执行**。新增真实行锁/generation 接管后旧 Worker 流式/非流式零派发、旧已发生费用仍可上报；既有取消/迟到/提交失败重放用例补齐真实执行所有权。
-- 项目默认全量后端 `pytest -q --tb=line` 正在运行；结果在本节后补充。`RUN_API_HTTP=0`，真实 HTTP 套件按其现有 opt-in 规则不启动，不把 skip 当验证通过。
+- 最终代码 `54a51f4` 默认全量后端：**905 passed / 90 failed / 130 skipped / 4 errors / 7 warnings**，退出码 1，耗时 271.60 秒。`RUN_API_HTTP=0`，真实 HTTP 套件按其现有 opt-in 规则不启动，不把 skip 当验证通过。JUnit 实际错误中，55 项是 MySQL 连接拒绝，31 项是缺少 `begin` 的测试替身/调用契约，另外包含 coroutine 不可迭代、Redis heartbeat 断言、Settings 字段及 503 断言等；4 项 setup error 是 Alembic 子进程失败。未将这些全部归因于环境，也未证明它们全部是旧基点失败。完整命令、94 项失败/错误名称和摘要见 [全量门禁清单](t07-dispatch-full-gate-20261017.md)。
+- 独立双轴代码审查范围为 `e2b2d75...54a51f4`，包含 `a9e2847` 和 `54a51f4`。Standards：硬性违规 0、判断性 smell 0；Spec：确认缺陷 0、规格外行为 0。审查发现的 COMMIT 跨租约窗口已在后一个提交补红绿回归并修复；静态结论不能替代真实 MySQL 验收。
 
 仍未验证：真实 MySQL revision 54、RR/行锁/事务回滚、真实 Worker 接管、Redis 暂停/强杀/数据库延迟与负载矩阵。前端没有修改，本轮未重跑前轮 346 项及 typecheck/build，不将旧数字当本轮结果。整个 T07 仍不满足部署条件。
 
