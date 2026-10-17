@@ -1,9 +1,10 @@
 """SQL state regressions for resend; MySQL locking is verified separately."""
 
 from datetime import datetime, timedelta, timezone
+from copy import copy
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import MetaData, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from server.auth import code_store
@@ -16,7 +17,12 @@ async def test_resend_accepts_only_new_code_and_retains_both_send_records(old_se
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     try:
         async with engine.begin() as connection:
-            await connection.exec_driver_sql("CREATE TABLE nlp_auth_codes (id VARCHAR(36) PRIMARY KEY, kind VARCHAR(16) NOT NULL, subject VARCHAR(64) NOT NULL, code_hash VARCHAR(64) NOT NULL, expires_at DATETIME NOT NULL, client_ip VARCHAR(64), created_at DATETIME NOT NULL)")
+            table = AuthCodeModel.__table__.to_metadata(MetaData())
+            for column in table.c:
+                if getattr(column.type, "collation", None):
+                    column.type = copy(column.type)
+                    column.type.collation = None
+            await connection.run_sync(table.create)
         factory = async_sessionmaker(engine, expire_on_commit=False)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         async with factory.begin() as session:

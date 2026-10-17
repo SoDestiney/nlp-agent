@@ -11,6 +11,10 @@
 - 真实 HTTP 新增 accepted/running 取消和 MySQL 进程内 prepare→dispatch→usage→settlement 回归，已有 2100 条事件并发补写回归保留。
 - PR HTTP marker 从 smoke 扩展为 `api_smoke or api_async_core`。真实异步检查结果以本轮 CI 为准，不沿用 1082e76 的 smoke 全绿结论。
 - 后台独立生命周期、副作用幂等、50/30 负载、双 Worker 故障矩阵与完整课堂观察仍不在已验证范围。
+- 扩展异步检查进一步发现完成事件提交空窗，现终态与对应事件同事务提交；前台 transcript 在有 fence 时等待有界持久化完成，不能在终态后继续借用失效 fence。
+- 修正隔离 HTTP 测试进程缓存的数据库 DSN、Nullable 排队字段断言、超时分类和短信 TTL；未排除任何新增异步用例。
+- 短信历史与旧 `(kind,subject)` 唯一键冲突已在实际模型约束下复现。新增 head `20261017_55_t07_sms_history`，只对有效身份保留唯一保护，发送中/历史记录允许多条；不会删除限流历史。降级遇到重复历史会先报错，需管理员归档后操作。
+- 所有真实并发/迟到用量/进程内结算回归以最新扩展 CI 的结果为准，不能继续沿用 revision 54 与 smoke 全绿作为验收结论。
 
 ## PR #252 首轮 CI 修复
 

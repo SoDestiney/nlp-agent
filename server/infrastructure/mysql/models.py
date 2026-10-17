@@ -1420,7 +1420,7 @@ class AuthCodeModel(Base):
 
     __tablename__ = "nlp_auth_codes"
     __table_args__ = (
-        UniqueConstraint("kind", "subject", name="uq_nlp_auth_codes_kind_subject"),
+        UniqueConstraint("kind", "active_subject", name="uq_nlp_auth_codes_kind_subject"),
         Index("ix_nlp_auth_codes_kind_subject", "kind", "subject"),
         Index("ix_nlp_auth_codes_kind_ip_created", "kind", "client_ip", "created_at"),
     )
@@ -1428,6 +1428,9 @@ class AuthCodeModel(Base):
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     subject: Mapped[str] = mapped_column(String(254), nullable=False)
+    active_subject: Mapped[str | None] = mapped_column(
+        String(254), Computed("CASE WHEN kind IN ('sms_history','sms_attempt') THEN NULL ELSE subject END", persisted=True),
+    )
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, index=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
