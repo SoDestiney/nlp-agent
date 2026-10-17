@@ -11,7 +11,7 @@ from sqlalchemy import text
 from gateway.contracts import GatewayEventType, TurnStatus
 from gateway.execution_fence import LostTurnClaimError, TurnWriteFence, bind_turn_write_fence
 from ..support.resources import create_session
-from ..auth.test_registration_core import _captcha, _register, CAPTCHA_CODE
+from ..auth.test_registration_core import _captcha, CAPTCHA_CODE
 
 pytestmark = pytest.mark.api_async_core
 
@@ -67,7 +67,11 @@ def test_sms_resend_accepts_new_code_and_preserves_history_over_http(http_client
             mysql_probe.execute("UPDATE nlp_auth_codes SET created_at=UTC_TIMESTAMP(6)-INTERVAL 61 SECOND WHERE subject=:phone", phone=phone)
     assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_auth_codes WHERE subject=:phone", phone=phone) == 2
     assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_auth_codes WHERE subject=:phone AND kind='sms_history'", phone=phone) == 1
-    registered = _register(http_client, mysql_probe, phone=phone, sms_code="222222")
+    captcha_id = _captcha(http_client, mysql_probe)
+    registered = http_client.post("/api/v1/auth/register", json={
+        "phone_number": phone, "sms_code": "222222", "password": "T07-register-password!",
+        "display_name": "T07 resend", "captcha_id": captcha_id, "captcha_code": CAPTCHA_CODE,
+    })
     assert registered.status_code == 201, registered.text
     # Request-scoped dependency cleanup may commit just after the response is
     # delivered. Observe durable state with a bounded wait, not a timing race.

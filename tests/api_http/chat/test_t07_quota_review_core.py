@@ -152,7 +152,10 @@ def test_terminal_turn_keeps_pending_budget_and_settles_late_usage_once(report_f
             with pytest.raises(AdmissionLimitError):
                 await reporter.prepare(call.model_copy(update={"operation_id": str(uuid.uuid4())}))
             if not report_failure:
-                await asyncio.to_thread(repo.update_turn, turn, TurnStatus.CANCELLED)
+                # Cancellation is a Web command, not a write by the provider
+                # execution context. Keep its lease bound for the late report.
+                with bind_turn_write_fence(None):
+                    await asyncio.to_thread(repo.request_turn_cancellation, turn_id=turn, requested_by=student_user.user_id)
             assert mysql_probe.scalar("SELECT status FROM nlp_model_quota_reservations WHERE id=:id", id=reservation) == "reserved"
             assert mysql_probe.scalar("SELECT pending_invocations FROM nlp_model_quota_reservations WHERE id=:id", id=reservation) == 1
             if report_failure:
