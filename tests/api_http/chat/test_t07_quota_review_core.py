@@ -19,6 +19,56 @@ from ..support.resources import create_session
 pytestmark = pytest.mark.api_async_core
 
 
+def test_mysql_inprocess_turn_passes_provider_gate_and_settles_usage(authenticated_client, student_user, mysql_probe, api_http_environment, tmp_path):
+    from core.learning import TeachingMaterials
+    from core.session_context import SessionContext
+    from core.model_runtime.usage import CanonicalTokenUsage, InvocationOutcome, ModelIdentity, ModelInvocation, current_usage_attribution
+    from gateway.core import BackendGateway
+    from gateway.dispatch import ExecutionAuthorizationContext, TurnTask
+    from gateway.mysql_repository import MySQLGatewayRepository
+    from server.model_usage.quota import DurableQuotaUsageReporter
+    from server.rbac.service import rbac_service
+
+    conversation = create_session(authenticated_client, workspace_id=student_user.workspace_id)["session_id"]
+    turn, reservation = str(uuid.uuid4()), str(uuid.uuid4())
+    repo = MySQLGatewayRepository(api_http_environment.env["NLP_AGENT_DATABASE_URL"])
+    repo.create_turn(turn_id=turn, session_id=conversation, workspace_id=student_user.workspace_id, user_id=student_user.user_id, input_text="inprocess", idempotency_key=None, quota_reservation_id=reservation, reserved_tokens=1000)
+    calls = []
+
+    async def exercise():
+        class Engine:
+            async def run_turn(self, *_args):
+                attr = current_usage_attribution()
+                call = ModelInvocation(operation_id=str(uuid.uuid4()), started_at=datetime.now(timezone.utc), attempt=1, fallback_index=0,
+                    identity=ModelIdentity(provider="fake", provider_model="fake", preset="fake", context_window_tokens=1000, max_output_tokens=100),
+                    attribution=attr.model_copy(update={"reservation_id": attr.token_reservation_id}))
+                await reporter.prepare(call)
+                reporter.check_dispatch(call)
+                calls.append(call.operation_id)
+                await reporter.report(call, CanonicalTokenUsage(source="provider", input_tokens=3, total_tokens=3), InvocationOutcome(status="succeeded", completed_at=datetime.now(timezone.utc)))
+                return "answer"
+
+        gateway = BackendGateway(repository=repo, engine=Engine())
+        reporter = DurableQuotaUsageReporter(gateway.authorization_session_factory, journal_directory=tmp_path)
+        try:
+            async with gateway.authorization_session_factory() as session:
+                principal = await rbac_service.principal_for_user_id(session, student_user.user_id)
+            task = TurnTask(context=SessionContext(session_id=conversation, user_id=student_user.user_id, workspace_id=student_user.workspace_id), turn_id=turn, content="inprocess", learning_context=None, learning_progress=None, exercise_state=None, teaching_materials=TeachingMaterials(), guided_session_id=None, exercise_session_id=None, quota_reservation_id=reservation, authorization=ExecutionAuthorizationContext(principal.user_id, student_user.workspace_id, principal.authorization_version))
+            await gateway.dispatcher._execute(task)
+        finally:
+            await gateway._database_runtime.close()
+
+    try:
+        asyncio.run(exercise())
+        assert len(calls) == 1
+        assert repo.get_turn(turn).status == TurnStatus.COMPLETED
+        assert mysql_probe.scalar("SELECT status FROM nlp_model_quota_reservations WHERE id=:id", id=reservation) == "settled"
+        assert mysql_probe.scalar("SELECT settled_tokens FROM nlp_model_quota_reservations WHERE id=:id", id=reservation) == 3
+        assert mysql_probe.scalar("SELECT pending_invocations FROM nlp_model_quota_reservations WHERE id=:id", id=reservation) == 0
+    finally:
+        repo.close()
+
+
 @pytest.fixture(autouse=True)
 def _runtime_database(api_http_environment, monkeypatch):
     # The harness selects its isolated DSN only after collection. Runtime

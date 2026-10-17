@@ -555,9 +555,40 @@ class MySQLGatewayRepository:
             rows = c.execute(text("SELECT e.*, t.conversation_id FROM nlp_turn_events e JOIN nlp_turns t ON t.id=e.turn_id WHERE e.turn_id=:id AND e.sequence>:after ORDER BY e.sequence LIMIT :limit"), {"id": turn_id, "after": max(0, after_sequence), "limit": min(max(1, limit), 2000)}).mappings().all()
         return [GatewayEvent(event_id=r["id"], turn_id=turn_id, session_id=r["conversation_id"], sequence=r["sequence"], type=GatewayEventType(r["event_type"]), created_at=r["created_at"], payload=self._json(r["payload_json"])) for r in rows]
 
-    def ensure_event(self, *, turn_id: str, session_id: str, event_type: GatewayEventType, payload=None, expected_claim_generation: int | None = None) -> GatewayEvent:
-        existing = next((e for e in self.events_after(turn_id, limit=2000) if e.type == event_type), None)
-        return existing or self.append_event(turn_id=turn_id, session_id=session_id, event_type=event_type, payload=payload, expected_claim_generation=expected_claim_generation)
+    def ensure_event(self, *, turn_id: str, session_id: str, event_type: GatewayEventType, payload=None, expected_claim_generation: int | None = None, _connection: Connection | None = None) -> GatewayEvent:
+        # Serialize lookup and insertion on the Turn row, using the caller's
+        # transaction when cancellation already holds it. A separate connection
+        # would deadlock or lose atomicity; paginated replay is not an existence
+        # check, especially for long streams.
+        with (self._runtime_begin() if _connection is None else nullcontext(_connection)) as c:
+            terminal_event = event_type in {
+                GatewayEventType.TURN_COMPLETED, GatewayEventType.MESSAGE_COMPLETED,
+                GatewayEventType.TURN_FAILED, GatewayEventType.TURN_CANCELLED,
+            }
+            self._lock_turn_for_write(c, turn_id, terminal_event=terminal_event)
+            turn = c.execute(text(
+                "SELECT claim_generation,conversation_id FROM nlp_turns WHERE id=:id FOR UPDATE"
+            ), {"id": turn_id}).mappings().first()
+            if turn is None:
+                raise KeyError(turn_id)
+            if expected_claim_generation is not None and int(turn["claim_generation"]) != expected_claim_generation:
+                raise TurnClaimMismatchError(turn_id)
+            existing = c.execute(text(
+                "SELECT id,sequence,created_at,payload_json FROM nlp_turn_events "
+                "WHERE turn_id=:turn AND event_type=:type ORDER BY sequence LIMIT 1 FOR UPDATE"
+            ), {"turn": turn_id, "type": event_type.value}).mappings().first()
+            if existing is not None:
+                return GatewayEvent(
+                    event_id=existing["id"], turn_id=turn_id,
+                    session_id=turn["conversation_id"], sequence=existing["sequence"],
+                    created_at=existing["created_at"], type=event_type,
+                    payload=self._json(existing["payload_json"]),
+                )
+            return self.append_event(
+                turn_id=turn_id, session_id=turn["conversation_id"],
+                event_type=event_type, payload=payload,
+                expected_claim_generation=expected_claim_generation, _connection=c,
+            )
 
     def list_turns(self, session_id: str, *, limit: int = 100) -> list[TurnRecord]:
         with self._engine.connect() as c:

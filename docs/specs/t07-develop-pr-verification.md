@@ -2,6 +2,16 @@
 
 状态：供审查的 Draft PR，不是部署批准。
 
+## 1082e76 复审：取消、终态幂等、进程内所有权
+
+- 已复现：accepted/running 取消调用因 `ensure_event(_connection=...)` 不兼容而抛 TypeError；长流的已有终态被前 2000 条扫描遗漏；MySQL 进程内执行没有 fence 而失败。
+- `ensure_event` 现在复用调用方连接，在 Turn 行锁内执行按事件类型的锁定查找与插入；保留 expected generation 与 owner fencing。取消状态、取消命令、取消事件同事务提交，补写失败整体回滚。
+- MySQL 进程内模式复用 FencedTurnExecutor 的 claim、续租、授权复核、durable reservation 和本地失权保护；没有放宽 Provider 门禁。显式注入 repository 时从相同 DSN 建立异步运行时。
+- 本地定向 143 项通过，Ruff 与 diff 检查通过；SQLite 事务回归仅适配 SQL 方言，不冒充 MySQL 行锁并发验收。
+- 真实 HTTP 新增 accepted/running 取消和 MySQL 进程内 prepare→dispatch→usage→settlement 回归，已有 2100 条事件并发补写回归保留。
+- PR HTTP marker 从 smoke 扩展为 `api_smoke or api_async_core`。真实异步检查结果以本轮 CI 为准，不沿用 1082e76 的 smoke 全绿结论。
+- 后台独立生命周期、副作用幂等、50/30 负载、双 Worker 故障矩阵与完整课堂观察仍不在已验证范围。
+
 ## PR #252 首轮 CI 修复
 
 - 旧 revision 02 原先读取实时 TurnModel，导致在额度表创建前声明 T07 外键。现冻结该 revision 的 Turn DDL，额度列/外键仍由 revision 52 创建。

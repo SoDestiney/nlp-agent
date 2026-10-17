@@ -281,7 +281,24 @@ class BackendGateway:
                 ),
             )
             self._in_process_executor = executor
-            self.dispatcher = dispatcher or InProcessTurnDispatcher(executor.run)
+            execute = executor.run
+            if dispatcher is None and isinstance(self.repository, MySQLGatewayRepository):
+                from server.worker.fencing import FencedTurnExecutor
+
+                if self._database_runtime is None:
+                    # Explicit MySQL repositories must share the same database,
+                    # not silently select the process's default DSN.
+                    dsn = self.repository._engine.url.render_as_string(hide_password=False)
+                    self._database_runtime = MySQLRuntime.from_runtime({
+                        **settings.database_runtime,
+                        "url": dsn.replace("mysql+pymysql://", "mysql+aiomysql://", 1),
+                    })
+                execute = FencedTurnExecutor(
+                    self._database_runtime.uow, TurnReliabilityService(), executor.run,
+                    worker_id=f"inprocess-{uuid.uuid4()}",
+                    lease_s=int(gateway_config.get("mysql_turn_lease_s", 60)),
+                )
+            self.dispatcher = dispatcher or InProcessTurnDispatcher(execute)
         self._session_turn_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.shutdown_grace_s = max(
             0.0,

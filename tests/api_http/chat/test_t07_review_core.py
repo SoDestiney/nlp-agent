@@ -101,3 +101,17 @@ def test_long_event_stream_terminal_repair_is_concurrently_idempotent(authentica
         assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_turn_events WHERE turn_id=:id AND event_type='turn.failed'", id=turn_id) == 1
     finally:
         repository.close()
+
+
+@pytest.mark.parametrize("status", ["accepted", "running"])
+def test_cancel_commits_one_terminal_and_releases_capacity(status, authenticated_client, student_user, mysql_probe):
+    session = create_session(authenticated_client, workspace_id=student_user.workspace_id)
+    turn = str(uuid.uuid4())
+    mysql_probe.execute("INSERT INTO nlp_turns(id,conversation_id,workspace_id,user_id,status,input_text) VALUES(:id,:conversation,:workspace,:user,:status,'cancel target')", id=turn, conversation=session["session_id"], workspace=student_user.workspace_id, user=student_user.user_id, status=status)
+    for _ in range(2):
+        cancelled = authenticated_client.post(f"/api/v1/chat/turns/{turn}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelled"
+    assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_turn_events WHERE turn_id=:id AND event_type='turn.cancelled'", id=turn) == 1
+    assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_turn_cancellations WHERE turn_id=:id", id=turn) == 1
+    assert mysql_probe.scalar("SELECT COUNT(*) FROM nlp_turns WHERE id=:id AND status IN ('accepted','running')", id=turn) == 0
