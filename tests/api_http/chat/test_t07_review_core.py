@@ -10,16 +10,21 @@ from sqlalchemy import text
 
 from gateway.contracts import GatewayEventType, TurnStatus
 from gateway.execution_fence import LostTurnClaimError, TurnWriteFence, bind_turn_write_fence
-from gateway.mysql_repository import MySQLGatewayRepository
 from ..support.resources import create_session
 from ..auth.test_registration_core import _captcha, _register, CAPTCHA_CODE
 
 pytestmark = pytest.mark.api_async_core
 
 
+@pytest.fixture(autouse=True)
+def _runtime_database(api_http_environment, monkeypatch):
+    monkeypatch.setenv("NLP_AGENT_DATABASE_URL", api_http_environment.env["NLP_AGENT_DATABASE_URL"])
+
+
 def test_mysql_rejects_old_worker_writes_and_http_replays_handover(
     authenticated_client, student_user, mysql_probe, api_http_environment,
 ):
+    from gateway.mysql_repository import MySQLGatewayRepository
     session = create_session(authenticated_client, workspace_id=student_user.workspace_id)
     turn_id = str(uuid.uuid4())
     mysql_probe.execute(
@@ -77,6 +82,7 @@ def test_sms_resend_accepts_new_code_and_preserves_history_over_http(http_client
 
 
 def test_long_event_stream_terminal_repair_is_concurrently_idempotent(authenticated_client, student_user, mysql_probe, api_http_environment):
+    from gateway.mysql_repository import MySQLGatewayRepository
     session = create_session(authenticated_client, workspace_id=student_user.workspace_id)
     turn_id = str(uuid.uuid4())
     mysql_probe.execute("INSERT INTO nlp_turns(id,conversation_id,workspace_id,user_id,status,input_text) VALUES(:id,:conversation,:workspace,:user,'failed','long stream')", id=turn_id, conversation=session["session_id"], workspace=student_user.workspace_id, user=student_user.user_id)

@@ -12,17 +12,22 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.orm import Session
 
-from core.model_runtime.usage import CanonicalTokenUsage, InvocationOutcome, ModelIdentity, ModelInvocation, UsageAttributionContext
 from gateway.contracts import AdmissionLimitError, TurnStatus
 from gateway.execution_fence import LostTurnClaimError, TurnWriteFence, bind_turn_write_fence
-from gateway.mysql_repository import MySQLGatewayRepository
-from server.model_usage.quota import DurableQuotaUsageReporter
 from ..support.resources import create_session
 
 pytestmark = pytest.mark.api_async_core
 
 
+@pytest.fixture(autouse=True)
+def _runtime_database(api_http_environment, monkeypatch):
+    # The harness selects its isolated DSN only after collection. Runtime
+    # imports below must use that DSN, never a developer's database.
+    monkeypatch.setenv("NLP_AGENT_DATABASE_URL", api_http_environment.env["NLP_AGENT_DATABASE_URL"])
+
+
 def test_reconcile_cannot_erase_admission_committed_after_its_snapshot(authenticated_client, student_user, mysql_probe, api_http_environment):
+    from gateway.mysql_repository import MySQLGatewayRepository
     repo = MySQLGatewayRepository(api_http_environment.env["NLP_AGENT_DATABASE_URL"])
     conversation = create_session(authenticated_client, workspace_id=student_user.workspace_id)["session_id"]
     turn, reservation = str(uuid.uuid4()), str(uuid.uuid4())
@@ -60,6 +65,9 @@ def test_reconcile_cannot_erase_admission_committed_after_its_snapshot(authentic
 
 @pytest.mark.parametrize("report_failure", [False, True])
 def test_terminal_turn_keeps_pending_budget_and_settles_late_usage_once(report_failure, authenticated_client, student_user, mysql_probe, api_http_environment, tmp_path):
+    from core.model_runtime.usage import CanonicalTokenUsage, InvocationOutcome, ModelIdentity, ModelInvocation, UsageAttributionContext
+    from gateway.mysql_repository import MySQLGatewayRepository
+    from server.model_usage.quota import DurableQuotaUsageReporter
     url = api_http_environment.env["NLP_AGENT_DATABASE_URL"]
     repo = MySQLGatewayRepository(url)
     conversation = create_session(authenticated_client, workspace_id=student_user.workspace_id)["session_id"]
@@ -138,6 +146,9 @@ def test_terminal_turn_keeps_pending_budget_and_settles_late_usage_once(report_f
 
 
 def test_new_generation_blocks_old_provider_dispatch_but_accepts_late_usage(authenticated_client, student_user, mysql_probe, api_http_environment, tmp_path):
+    from core.model_runtime.usage import CanonicalTokenUsage, InvocationOutcome, ModelIdentity, ModelInvocation, UsageAttributionContext
+    from gateway.mysql_repository import MySQLGatewayRepository
+    from server.model_usage.quota import DurableQuotaUsageReporter
     from core.model_runtime.reporters import ModelUsageReporterSlot
     from core.model_runtime.runtime import ResilientChatModel
     from core.model_runtime.usage import bind_usage_attribution
