@@ -17,9 +17,9 @@
 - 前端 `npm run lint`：通过。
 - 前端 `npm run build`：通过，有大 chunk 提醒。
 - 前端 `npm test -- --exclude src/platform/http/api.integration.test.ts`：76 个文件、601 项通过；明确未执行真实 HTTP 集成文件。
-- 后端核心六文件回归：133 项通过。其后补充额度公开错误码回归并继续运行扩大范围检查，结果见后续补充。
+- 后端最终扩大范围回归：310 项通过（8 个警告），覆盖额度、Gateway、Worker fencing/取消、模型调用、短信、负载脚本安全和迁移图/完整离线 SQL；使用 `.artifacts/pytest-focused-delivery` 独立临时目录。此前核心六文件的 133 项通过不是最终扩大回归计数。
 - `ruff check configs core gateway server tests scripts migrations`、`compileall`、`git diff --check`：通过。
-- 全量后端回归正在执行，已经出现失败/错误；不能称全量门禁通过，也不能未经基线比较就把所有失败归为旧问题。
+- 全量后端回归：1452 passed、61 failed、295 errors、149 skipped（341 秒），门禁为红。该轮未配置独立 basetemp，存在大量 Windows 共享 pytest 临时目录 WinError 5；运行期间又完成了最后两处定向修复，因此这不是最终提交的完整全量认证。独立目录下最终定向 310 项通过，不能替代全量重跑，也不能把其余失败一律归为旧问题或数据库不可用。
 
 前端首次沙箱内执行因临时缓存 rename EPERM 没有运行测试；相同命令在沙箱外重跑，得到上述 601 项通过。
 
