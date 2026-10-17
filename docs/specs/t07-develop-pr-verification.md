@@ -2,6 +2,14 @@
 
 状态：供审查的 Draft PR，不是部署批准。
 
+## PR #252 首轮 CI 修复
+
+- 旧 revision 02 原先读取实时 TurnModel，导致在额度表创建前声明 T07 外键。现冻结该 revision 的 Turn DDL，额度列/外键仍由 revision 52 创建。
+- HTTP 测试收集不再导入会初始化数据库的运行时；选中测试启动后使用隔离环境生成的 DSN。
+- MySQL 8.4 开启 binlog 时，非 SUPER 迁移账号创建触发器报 1419。仅对 CI/HTTP 临时 MySQL 启用 `log_bin_trust_function_creators`，应用继续使用普通账号。生产部署前应由 DBA 明确提供触发器迁移权限或配置此变量；应用不会自动扩大数据库权限。
+- HTTP 启动器不再对永久 DDL 错误反复执行非事务迁移，以免把原始错误掩盖成重复建表。
+- 新增回归先失败后修复；迁移与 CI 回归 21 项通过。真实 CI 结果需要后续单独记录。
+
 ## 基线与范围
 
 - 分支：`codex/t07-reliability-develop`，从 `origin/develop` 的 `cbbfb6e` 创建。

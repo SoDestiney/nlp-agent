@@ -502,6 +502,7 @@ def _docker_run_mysql(container: str, port: int, database: str) -> None:
             "--env",
             "MYSQL_ROOT_PASSWORD=root_api_http_password",
             MYSQL_IMAGE,
+            "--log-bin-trust-function-creators=ON",
         ]
     )
 
@@ -580,6 +581,10 @@ def _run_migrations(environment: dict[str, str]) -> None:
         if result.returncode == 0:
             return
         last_error = (result.stderr or result.stdout).strip()
+        # MySQL DDL commits before the revision is stamped. Only retry
+        # connection errors; otherwise preserve the first migration failure.
+        if not re.search(r"\((?:2002|2003|2006|2013),", last_error):
+            raise ApiHttpEnvironmentError(f"Alembic migration failed:\n{last_error}")
         time.sleep(2)
     raise ApiHttpEnvironmentError(f"Alembic migration failed after retries:\n{last_error}")
 
