@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import io
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
@@ -182,6 +184,11 @@ def test_database_authenticated_upload_uses_database_session_dependencies(
     )
     database_auth = FakeDatabaseAuth(claims)
     session_factory = FakeAuthorizationSessionFactory()
+    quota = AsyncMock(spec=uploads_controller.AsyncStorageQuota)
+    reservation = object()
+    quota.reserve.return_value = reservation
+    quota_factory = Mock(return_value=quota)
+    monkeypatch.setattr(uploads_controller, "AsyncStorageQuota", quota_factory)
     app = FastAPI()
     app.include_router(uploads_router)
     app.state.auth = LegacyAuthThatMustNotBeUsed()
@@ -236,6 +243,10 @@ def test_database_authenticated_upload_uses_database_session_dependencies(
     assert database_auth.token == "database-token"
     assert database_auth.origin == ("http://127.0.0.1:5173", "testserver")
     assert database_auth.csrf == "csrf-token"
+    quota_factory.assert_called_once_with(session_factory.session, owner_user_id="test_user", roles=mock_principal.roles)
+    quota.reserve.assert_awaited_once()
+    assert quota.reserve.await_args.kwargs["resource_type"] == "chat_image"
+    quota.finalize.assert_awaited_once_with(reservation, reconcile=True)
 
 
 def test_upload_corrupt_image_rejected(test_app: FastAPI) -> None:

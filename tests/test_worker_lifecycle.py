@@ -23,11 +23,10 @@ def test_durable_turn_does_not_allow_worker_to_outlive_its_parent_fence():
 
 
 @pytest.mark.asyncio
-async def test_spawn_worker_refuses_detached_child_inside_a_durable_turn(monkeypatch):
+async def test_spawn_worker_refuses_detached_child_inside_a_durable_turn():
     from gateway.execution_fence import TurnWriteFence, bind_turn_write_fence
     from server.tools.worker_tool import spawn_worker
 
-    monkeypatch.setattr("configs.settings.settings.get_agent_runtime", lambda _name: {})
     config = {
         "configurable": {
             "thread_id": "session-1",

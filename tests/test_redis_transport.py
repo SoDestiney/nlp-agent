@@ -172,8 +172,9 @@ async def test_dispatcher_counts_live_worker_heartbeats_and_preserves_unknown_st
     redis = FakeRedis()
     config = RedisTransportConfig(worker_heartbeat_prefix="test:workers:")
     dispatcher = RedisTurnDispatcher(redis, config)
-    redis.values["test:workers:one"] = "{}"
-    redis.values["test:workers:two"] = "{}"
+    redis.values["test:workers:one"] = json.dumps({"worker_id": "one", "concurrency": 1, "active_slots": 0})
+    redis.values["test:workers:two"] = json.dumps({"worker_id": "two", "concurrency": 4, "active_slots": 2})
+    redis.values["test:workers:invalid"] = "{}"
 
     assert await dispatcher.healthy_worker_count() == 2
     redis.ping_error = ConnectionError("redis unavailable")
