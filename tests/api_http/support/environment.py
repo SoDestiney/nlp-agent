@@ -76,6 +76,7 @@ class ManagedHttpEnvironment:
     full_probe_operations: set[tuple[str, str, str]] = field(default_factory=set)
     observed_websocket_routes: set[str] = field(default_factory=set)
     worker_process: subprocess.Popen[str] | None = None
+    worker_module: str = "tests.api_http.support.worker_entrypoint"
 
     @property
     def web_base_url(self) -> str:
@@ -199,7 +200,7 @@ class ManagedHttpEnvironment:
             [
                 sys.executable,
                 "-m",
-                "tests.api_http.support.worker_entrypoint",
+                self.worker_module,
             ],
             cwd=ROOT,
             env=self.env,

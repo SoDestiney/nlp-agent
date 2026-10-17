@@ -32,11 +32,15 @@ async def test_fenced_executor_claims_turn_before_invoking_agent(monkeypatch) ->
     factory.begin.return_value = unit_of_work
     reliability = AsyncMock()
     reliability.claim_turn.return_value = 4
-    observed_context = None
+    captured_fences = []
+    captured_contexts = []
 
-    async def execute(_task, _context):
-        nonlocal observed_context
-        observed_context = current_turn_execution_context()
+    async def execute(_task, context):
+        from gateway.execution_fence import current_turn_write_fence
+
+        assert current_turn_execution_context() is context
+        captured_contexts.append(context)
+        captured_fences.append(current_turn_write_fence())
     principal = AuthenticatedPrincipal(
         user_id="user-1", workspace_ids=frozenset({"default"}),
         permissions=frozenset({Permission.AGENT_TURN_SUBMIT}), authorization_version=3,
@@ -70,11 +74,12 @@ async def test_fenced_executor_claims_turn_before_invoking_agent(monkeypatch) ->
         workspace_id="default",
     )
     unit_of_work.commit.assert_awaited_once()
-    execution = observed_context
-    assert execution is not None
+    execution = captured_contexts[0]
     assert execution.turn_id == "turn-1"
     assert execution.claim_generation == 4
     assert execution.operation_id == "turn.execution"
+    assert len(captured_fences) == 1
+    assert captured_fences[0].revoked is True
 
 
 @pytest.mark.asyncio

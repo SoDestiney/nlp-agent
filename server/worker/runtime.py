@@ -6,6 +6,7 @@ import asyncio
 import socket
 from functools import partial
 from typing import Any, Mapping
+import time
 
 from configs.settings import settings
 from gateway.contracts import GatewayEventType, TurnStatus
@@ -116,6 +117,8 @@ async def run_worker() -> None:
     if getattr(repository, "quota_service", None) is not None:
         repository.quota_service.set_snapshot_notifier(quota_snapshot_publisher)
         await asyncio.to_thread(repository.quota_service.verify_schema)
+    await asyncio.to_thread(repository.reconcile_capacity)
+    await asyncio.to_thread(repository.reconcile_model_quota)
     engine = LangGraphAgentEngine()
     publisher = RedisEventPublisher(redis, config)
     reliability = TurnReliabilityService()
@@ -247,10 +250,20 @@ async def run_worker() -> None:
     if quota_reaper is not None:
         quota_reaper.start()
 
+    capacity_reconcile_interval_s = max(
+        5, settings.NLP_AGENT_TURN_CAPACITY_RECONCILE_INTERVAL_S
+    )
+    next_capacity_reconcile = time.monotonic() + capacity_reconcile_interval_s
+
     async def relay_forever() -> None:
+        nonlocal next_capacity_reconcile
         relay = OutboxRelay(redis, stream=config.task_stream, relay_id=worker_id, authorization_channel=config.authorization_channel)
         while True:
             try:
+                if time.monotonic() >= next_capacity_reconcile:
+                    next_capacity_reconcile = time.monotonic() + capacity_reconcile_interval_s
+                    await asyncio.to_thread(repository.reconcile_capacity)
+                    await asyncio.to_thread(repository.reconcile_model_quota)
                 async with database_runtime.uow.begin() as unit_of_work:
                     await reliability.recover_stuck_turns(unit_of_work.session)
                     await unit_of_work.commit()
@@ -268,9 +281,21 @@ async def run_worker() -> None:
         summary_sweep_loop(database_runtime.session_factory),
         name="session-summary-sweep",
     )
+    usage_reporter_configured = False
     try:
+        from core.model_runtime.reporters import configure_global_model_usage_reporter
+        from server.model_usage.quota import DurableQuotaUsageReporter
+
+        configure_global_model_usage_reporter(
+            DurableQuotaUsageReporter(database_runtime.session_factory)
+        )
+        usage_reporter_configured = True
         await worker.run_forever()
     finally:
+        if usage_reporter_configured:
+            from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+            configure_global_model_usage_reporter(None)
         relay_task.cancel()
         summary_sweep_task.cancel()
         await asyncio.gather(relay_task, summary_sweep_task, return_exceptions=True)

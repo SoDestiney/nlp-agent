@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from core.identity import AuthenticatedPrincipal
 from core.rbac import Permission, authorization_service
-from gateway.contracts import GatewayEventType, InjectMessageRequest, SubmitTurnRequest
+from gateway.contracts import AdmissionLimitError, GatewayEventType, InjectMessageRequest, SubmitTurnRequest
 from gateway.core import BackendGateway
 from gateway.events import GatewayEventStreamInterrupted, GatewayEventSubscription
 from server.web.auth import (
@@ -534,6 +534,13 @@ class WebSocketConnection:
 
 def _command_error(error: Exception) -> tuple[str, str, dict[str, Any]]:
     name = type(error).__name__
+    if isinstance(error, AdmissionLimitError):
+        messages = {
+            AdmissionLimitError.QUEUE_CAPACITY_EXCEEDED: "当前课堂排队人数较多，请稍后重试。",
+            AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED: "你的进行中任务已达上限，请等待已有任务完成。",
+            AdmissionLimitError.MODEL_QUOTA_EXCEEDED: "模型额度不足，暂时无法提交任务。",
+        }
+        return error.code, messages[error.code]
     if isinstance(error, StorageQuotaExceeded):
         return "storage_quota_exceeded", "账户通用存储空间已达到配额，请清理会话、记忆或图片后重试", {}
     if isinstance(error, QuotaRejectedError):
@@ -601,6 +608,8 @@ async def _dispatch_command(
                     "command": command.type,
                     "status": accepted.status.value,
                     "duplicate": accepted.duplicate,
+                    "queue_position": accepted.queue_position,
+                    "waited_s": accepted.waited_s,
                 },
             )
         )

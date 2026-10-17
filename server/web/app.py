@@ -31,6 +31,7 @@ from core.identity import AccessDeniedError, AuthenticatedPrincipal
 from core.rbac import Permission, ResourceRef, authorization_service
 from core.authorization_audit import begin as begin_authorization_audit, end as end_authorization_audit
 from gateway.contracts import (
+    AdmissionLimitError,
     GatewayNotStartedError,
     InjectMessageRequest,
     KnowledgeBookRevisionConflictError,
@@ -697,6 +698,10 @@ def create_app(
                 quota_snapshot_publisher.close()
             if sandbox_manager is not None:
                 await sandbox_manager.close()
+            if usage_reporter is not None:
+                from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+                configure_global_model_usage_reporter(None)
             await sandbox_model_service.close()
             from server.tools.academic.service import close_academic_search_service
 
@@ -1016,6 +1021,21 @@ def create_app(
             detail=str(error),
         )
 
+    @app.exception_handler(AdmissionLimitError)
+    async def admission_limit_error(request: Request, error: AdmissionLimitError):
+        titles = {
+            AdmissionLimitError.QUEUE_CAPACITY_EXCEEDED: "Classroom queue is full",
+            AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED: "Too many active turns",
+            AdmissionLimitError.MODEL_QUOTA_EXCEEDED: "Model usage quota exceeded",
+        }
+        return _problem(
+            request,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code=error.code,
+            title=titles[error.code],
+            headers={"Retry-After": "5"},
+        )
+
     @app.exception_handler(GatewayNotStartedError)
     async def gateway_error(request: Request, _error: GatewayNotStartedError):
         return _problem(
@@ -1116,6 +1136,11 @@ def create_app(
             },
             status_code=200 if ready else 503,
         )
+
+    @app.get("/api/v1/observability/runtime", tags=["observability"])
+    async def runtime_observability(request: Request, principal: Principal):
+        authorization_service.require(principal, Permission.SYSTEM_RUNTIME_MONITOR)
+        return await request.app.state.gateway.runtime_metrics()
 
     @app.get("/api/v1/auth/captcha", tags=["auth"])
     async def get_captcha(db: DbSession):

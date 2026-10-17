@@ -142,7 +142,15 @@ export function useStudentWorkspace() {
 
   useEffect(() => {
     if (bootStatus !== "ready") return;
-    const socket = new StudentSocket(handleEvent, setSocketStatus, undefined, globalAuth?.refreshSession);
+    const socket = new StudentSocket(
+      handleEvent,
+      setSocketStatus,
+      async () => {
+        const sessionId = activeSessionRef.current;
+        if (sessionId) await loadTurns(sessionId);
+      },
+      globalAuth?.refreshSession,
+    );
     socketRef.current = socket;
     socket.setSession(activeSessionRef.current);
     socket.connect();
@@ -151,7 +159,7 @@ export function useStudentWorkspace() {
       socket.close();
       socketRef.current = null;
     };
-  }, [activeSessionRef, bootStatus, globalAuth?.refreshSession, handleEvent]);
+  }, [activeSessionRef, bootStatus, globalAuth?.refreshSession, handleEvent, loadTurns]);
 
   useEffect(() => {
     // AuthProvider is the single global 401 boundary. If a request made by

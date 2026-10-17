@@ -145,9 +145,10 @@ class FencedTurnExecutor:
             await execution
             return True
         finally:
+            # Revoke inherited context immediately when this Turn stops owning execution.
+            # Child asyncio tasks share this fence object, so late writes fail closed.
             fence.revoke()
             if not execution.done():
-                fence.revoke()
                 execution.cancel()
                 try:
                     await asyncio.wait_for(

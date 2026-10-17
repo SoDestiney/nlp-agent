@@ -38,6 +38,7 @@ class TurnTask:
     thinking_enabled: bool = True
     authorization: ExecutionAuthorizationContext | None = None
     reservation_id: str | None = None
+    quota_reservation_id: str | None = None
 
 
 class TurnDispatcher(Protocol):

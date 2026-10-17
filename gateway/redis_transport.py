@@ -107,15 +107,44 @@ class RedisTurnDispatcher:
         try:
             if not await self._redis.ping():
                 return None
-            keys = self._redis.scan_iter(
-                match=f"{self.config.worker_heartbeat_prefix}*"
-            )
-            count = 0
-            async for _ in keys:
-                count += 1
-            return count
+            workers = await self.worker_heartbeats()
+            return len(workers) if workers is not None else None
         except Exception:
             logger.warning("Unable to read worker heartbeats; preserving MySQL outbox admission", exc_info=True)
+            return None
+
+    async def worker_heartbeats(self) -> list[dict[str, Any]] | None:
+        """Read current TTL-backed Worker slot gauges without identity labels."""
+        try:
+            if not await self._redis.ping():
+                return None
+            workers: list[dict[str, Any]] = []
+            async for key in self._redis.scan_iter(
+                match=f"{self.config.worker_heartbeat_prefix}*"
+            ):
+                raw = await self._redis.get(key)
+                if not raw:
+                    continue
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    continue
+                if not all(
+                    isinstance(value.get(name), int)
+                    for name in ("concurrency", "active_slots")
+                ):
+                    continue
+                workers.append(
+                    {
+                        "worker_id": str(value.get("worker_id") or ""),
+                        "started_at": float(value.get("started_at") or 0),
+                        "concurrency": max(0, int(value["concurrency"])),
+                        "active_slots": max(0, int(value["active_slots"])),
+                        "version": int(value.get("version") or 0),
+                    }
+                )
+            return workers
+        except Exception:
+            logger.warning("Unable to read Worker heartbeat gauges", exc_info=True)
             return None
 
     def observe(self, event: GatewayEvent) -> None:
@@ -663,6 +692,7 @@ class TurnTaskCodec:
                 "model_profile": task.model_profile,
                 "thinking_enabled": task.thinking_enabled,
                 "reservation_id": task.reservation_id,
+                "quota_reservation_id": task.quota_reservation_id,
                 "authorization": (
                     {
                         "submitter_user_id": task.authorization.submitter_user_id,
@@ -701,4 +731,5 @@ class TurnTaskCodec:
                 ExecutionAuthorizationContext(**value["authorization"])
                 if value.get("authorization") else None
             ),
+            quota_reservation_id=value.get("quota_reservation_id"),
         )

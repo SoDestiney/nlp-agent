@@ -1,6 +1,27 @@
 # T07 复审修复与验证记录
 
-日期：2026-10-16。状态：六项复审 P1 已修复；T07 整体验收未完成，不可据此部署。
+日期：2026-10-17。状态：六项复审 P1 的历史修复与本轮开发侧补齐均有代码；T07 整体验收未完成，不可据此部署。
+
+以下标注为此前日期的执行记录属于历史快照；当前代码与验证状态以“2026-10-17 开发侧补齐”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+
+## 2026-10-17 开发侧补齐
+
+在 Docker/真实数据库验收之前，已继续实现以下开发内容：
+
+- Alembic revision `20261016_51_t07` 新增 MySQL 全局 queued/running 与 per-user active 计数器及触发器；默认排队容量 200、用户 active 上限 3。接单、状态迁移、取消/完成和删除通过同一事务内的触发器维护；Worker 启动及周期任务执行计数 reconcile。
+- Revision `20261016_52_t07` 新增模型额度账户、Turn Reservation、幂等 Usage Event；reservation 与 Turn/outbox 同事务写入，通过 Redis 任务传播 reservation ID；Reporter 将 Provider usage 按 operation ID 幂等入账；终态触发器释放预留，Worker 周期 reconcile 孤儿/漂移。
+- 课堂消息 UI 展示排队位置和服务器等待时间，并在等待期间递增；重连后刷新服务端 Turn 历史，继续显示排队状态并可取消。
+- 增加运行时观测接口与仓库指标，包括队列深度/最老等待、待投递 outbox、恢复 handover、额度预留/未知用量，以及同步/异步连接池占用和 Worker heartbeat/槽位。
+- MySQL checkpoint 与 transcript 写入现在锁定并核对 Turn 状态、generation、worker owner 和有效 lease。Turn executor 完成或失去 lease 后撤销共享 fence；在 fenced Turn 内拒绝 `join=false` 的临时 Worker，避免它借父 Turn 写入。该限制是安全降级，不等于已实现独立持久 Worker 生命周期。
+- 加入 Admission 错误码映射、并发/事务/重试与 quota reconcile 的真实数据库测试，以及 Worker 脱离父 Turn 和排队等待计时的回归用例；这些 MySQL/前端用例尚未在本轮运行。
+
+本轮非 Docker 可执行验证：
+
+- Ruff、Python `compileall`、`git diff --check`：通过。
+- `tests/test_t07_admission_codes.py`、Worker 生命周期同步用例及 load safety 同步用例：**14 passed, 1 deselected**。另有无 DSN 的一轮选择性运行出现一个配置导入失败和两个临时目录 setup error，随后通过工作区临时目录和仅供导入的占位 DSN 重跑；不把首次失败计为通过。
+- Alembic 图解析：唯一 head 为 `20261016_52_t07`。这不是执行迁移。
+- 异步 Worker fence 测试在 Windows 测试运行器创建 asyncio event loop 时卡于系统 socketpair 初始化，已中断；不计作通过。前端测试/类型检查依赖在该隔离工作区不完整，未运行。
+- 本轮未启动 Docker、MySQL、Redis、Provider 或真实课堂负载；未生成新的 baseline/final/comparison，也未修改 Compose 扩容配置。
 
 ## 后续推进：WebSocket 取消与真实基线
 
@@ -184,12 +205,12 @@ python -m pytest tests/api_http/auth/test_registration_core.py tests/api_http/au
 
 ## 未完成与未验证
 
-1. 未实现 MySQL 权威队列容量、每用户并发限制及 reconcile。
-2. 未实现模型 Reservation/Usage Ledger、跨任务传播及所有终态的结算释放。storage quota 不等于模型额度。
-3. detached background worker resume 尚未有独立权威接单/lease 生命周期；不能绕过当前 fence 在完成的父 Turn 上继续写入。
-4. checkpoint、transcript、工具副作用的完整 generation/幂等审计仍需补齐，不能据事件/终态 fencing 声称所有副作用 exactly-once。
-5. 未补排队 ahead/waited UI 和完整 DB pool/queue/slot 指标。
-6. 尚无旧版本 50 登录/30 Turn 基线、同参 final/comparison、1×1 → 1×4 → 2×4、强杀/Redis pause/DB delay/慢短信/额度耗尽全矩阵结果。
-7. Docker 已可用，不能把以上缺口归因于环境阻塞；它们分别属于未实现、未执行验收和已复现的原有测试问题。
+1. Admission 触发器、额度 Reservation/Usage ledger、触发器终态释放以及 pool/runtime 指标均尚未在真实 MySQL 执行迁移或集成验证；静态检查和单测不能证明 SQL 并发语义、触发器回滚或容量计数无漂移。
+2. 后台 Worker 目前在 fenced Turn 中禁止脱离式运行，但尚无独立持久任务表、接单/lease/取消/终态及恢复链路。工具副作用也尚未全面绑定持久 operation ID 与 generation，因此不满足双 Worker 的 exactly-once 启用前提。
+3. 指标提供当前 pool 使用量和配置 timeout，但尚未采集数据库连接等待时长/分位数；队列深度、最老任务、执行槽、恢复和额度泄漏指标也尚未接入生产监控告警。
+4. 前端排队显示/取消/重连恢复已实现代码，但本轮没有可用完整的前端依赖目录，未运行类型检查、测试或 build。
+5. 尚无冻结旧版本 50 登录/30 Turn 基线、同参 final/comparison、`1×1 → 1×4 → 2×4`、Worker 强杀、Redis pause、DB delay、慢短信、额度耗尽和 Provider 错误完整故障矩阵结果。
+6. 本地 pytest 的异步用例受 Windows 事件循环 socketpair 初始化阻塞；真实数据库/HTTP 测试尚未运行。历史全量回归曾有 36 项在冻结版本复现的旧失败，另外存在过时记录的偶发项；需按当前代码重新采集全量结果。
+7. 因上述实现/验证缺口，T07 仍不可部署或扩容。Compose 继续保持 1×1；不得把未运行的迁移、前端或真实负载验证描述为通过。
 
 下一阶段应先完成权威 Admission/模型额度账本及 background 生命周期，再执行完整隔离故障验收；在此之前不扩容生产。

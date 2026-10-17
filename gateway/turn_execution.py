@@ -538,9 +538,26 @@ class InProcessTurnExecutor:
             kwargs["knowledge_book_context"] = task.knowledge_book_context
         if self._accepts_thinking_enabled:
             kwargs["thinking_enabled"] = task.thinking_enabled
-        return await self._engine.run_turn(
-            task.context, task.turn_id, task.content, **kwargs
+        from core.model_runtime.usage import (
+            UsageAttributionContext,
+            bind_usage_attribution,
         )
+
+        fence = current_turn_write_fence()
+        attribution = UsageAttributionContext(
+            request_id=task.turn_id,
+            user_id=task.context.user_id,
+            workspace_id=task.context.workspace_id,
+            conversation_id=task.context.session_id,
+            turn_id=task.turn_id,
+            reservation_id=task.quota_reservation_id,
+            worker_id=fence.worker_id if fence is not None else None,
+            purpose="worker" if fence is not None else "coordinator",
+        )
+        with bind_usage_attribution(attribution):
+            return await self._engine.run_turn(
+                task.context, task.turn_id, task.content, **kwargs
+            )
 
     async def _finalize_learning(self, task: TurnTask, final_text: str) -> tuple[str, object]:
         if task.guided_session_id is not None:

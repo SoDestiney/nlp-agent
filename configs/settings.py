@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     NLP_AGENT_WORKER_SHUTDOWN_GRACE_S: float = 30.0
     NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S: float = 5.0
     NLP_AGENT_WORKER_HEARTBEAT_TTL_S: int = 15
+    NLP_AGENT_TURN_CAPACITY_RECONCILE_INTERVAL_S: int = 60
     NLP_AGENT_DB_CONNECT_TIMEOUT_S: int = 5
     NLP_AGENT_DB_STATEMENT_TIMEOUT_S: int = 30
     # Timezone used to bucket teacher-analytics hour/weekday and peak-hour

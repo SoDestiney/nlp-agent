@@ -16,6 +16,7 @@ from urllib.parse import unquote
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import DBAPIError
 
 from core.learning import ExerciseState, LearningContext, LearningProgress, knowledge_point_ids
 from core.observability.reset_lock import runtime_reset_lock, runtime_write_transaction
@@ -23,6 +24,7 @@ from gateway.analytics_time import localize_turn_time
 from gateway.contracts import (
     GatewayEvent,
     GatewayEventType,
+    AdmissionLimitError,
     KnowledgeBookRevisionConflictError,
     TeachingConfigurationError,
     TurnClaimMismatchError,
@@ -69,6 +71,24 @@ class MySQLGatewayRepository:
         with self._engine.connect() as c:
             row = c.execute(text("SELECT * FROM nlp_turns WHERE id=:id"), {"id": turn_id}).mappings().first()
             return dict(row) if row else None
+
+    @staticmethod
+    def _admission_limit_code(error: DBAPIError) -> str | None:
+        original_args = getattr(error.orig, "args", ())
+        if len(original_args) < 2 or original_args[0] != 1644:
+            return None
+        code = str(original_args[1])
+        if code == "user_active_limit_reached":
+            # Older migrations used an internal counter name as the public
+            # problem code. Preserve compatibility while exposing the stable
+            # T07 HTTP contract.
+            return AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED
+        if code in {
+            AdmissionLimitError.QUEUE_CAPACITY_EXCEEDED,
+            AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED,
+        }:
+            return code
+        return None
 
     def _record(self, row: dict[str, Any]) -> TurnRecord:
         state = self._json(row.get("learning_state_json") or {})
@@ -118,6 +138,97 @@ class MySQLGatewayRepository:
         if identity["workspace_id"] != workspace_id or identity["owner_user_id"] != user_id:
             raise PermissionError("conversation identity does not match the current session")
 
+    @staticmethod
+    def _reserve_model_quota(
+        connection: Connection,
+        *,
+        reservation_id: str,
+        turn_id: str,
+        user_id: str,
+        workspace_id: str,
+        reserved_tokens: int,
+    ) -> None:
+        estimate = max(0, int(reserved_tokens))
+        existing = connection.execute(
+            text(
+                "SELECT id,status FROM nlp_model_quota_reservations "
+                "WHERE turn_id=:turn FOR UPDATE"
+            ),
+            {"turn": turn_id},
+        ).mappings().first()
+        if existing is not None and str(existing["id"]) != reservation_id:
+            raise RuntimeError("a Turn cannot switch its model quota reservation")
+        if existing is not None and existing["status"] == "reserved":
+            return
+        connection.execute(
+            text(
+                "INSERT INTO nlp_model_quota_accounts(user_id) VALUES(:user) "
+                "ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)"
+            ),
+            {"user": user_id},
+        )
+        account = connection.execute(
+            text(
+                "SELECT quota_tokens,reserved_tokens,consumed_tokens "
+                "FROM nlp_model_quota_accounts WHERE user_id=:user FOR UPDATE"
+            ),
+            {"user": user_id},
+        ).mappings().one()
+        quota = account["quota_tokens"]
+        if quota is not None and (
+            int(account["reserved_tokens"])
+            + int(account["consumed_tokens"])
+            + estimate
+            > int(quota)
+        ):
+            raise AdmissionLimitError(AdmissionLimitError.MODEL_QUOTA_EXCEEDED)
+        if existing is not None:
+            connection.execute(
+                text(
+                    "UPDATE nlp_model_quota_accounts SET reserved_tokens=reserved_tokens+:tokens, "
+                    "updated_at=UTC_TIMESTAMP(6) WHERE user_id=:user"
+                ),
+                {"tokens": estimate, "user": user_id},
+            )
+            connection.execute(
+                text(
+                    "UPDATE nlp_model_quota_reservations SET reserved_tokens=:tokens, "
+                    "status='reserved',finalized_at=NULL WHERE id=:id"
+                ),
+                {"tokens": estimate, "id": reservation_id},
+            )
+            return
+        connection.execute(
+            text(
+                "UPDATE nlp_model_quota_accounts SET reserved_tokens=reserved_tokens+:tokens, "
+                "updated_at=UTC_TIMESTAMP(6) WHERE user_id=:user"
+            ),
+            {"tokens": estimate, "user": user_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO nlp_model_quota_reservations "
+                "(id,user_id,workspace_id,turn_id,reserved_tokens,status) "
+                "VALUES(:id,:user,:workspace,:turn,:tokens,'reserved')"
+            ),
+            {
+                "id": reservation_id,
+                "user": user_id,
+                "workspace": workspace_id,
+                "turn": turn_id,
+                "tokens": estimate,
+            },
+        )
+
+    @staticmethod
+    def _lock_turn_capacity(connection: Connection) -> None:
+        connection.execute(
+            text(
+                "SELECT scope_key FROM nlp_runtime_capacity "
+                "WHERE scope_key='global:turns' FOR UPDATE"
+            )
+        ).scalar_one()
+
     def create_turn(
         self,
         *,
@@ -131,6 +242,8 @@ class MySQLGatewayRepository:
         learning_progress=None,
         exercise_state=None,
         dispatch_payload: str | None = None,
+        quota_reservation_id: str | None = None,
+        reserved_tokens: int = 0,
         quota_admission: AdmitTurn | None = None,
         quota_role_codes: tuple[str, ...] = (),
         quota_classroom_ids: tuple[str, ...] = (),
@@ -316,6 +429,14 @@ class MySQLGatewayRepository:
             row = c.execute(text("SELECT * FROM nlp_turns WHERE user_id=:u AND conversation_id=:s AND idempotency_key=:k"), {"u": user_id, "s": session_id, "k": idempotency_key}).mappings().first()
         return self._record(dict(row)) if row else None
 
+    def quota_reservation_for_turn(self, turn_id: str) -> str | None:
+        with self._engine.connect() as c:
+            value = c.execute(
+                text("SELECT quota_reservation_id FROM nlp_turns WHERE id=:id"),
+                {"id": turn_id},
+            ).scalar_one_or_none()
+        return str(value) if value else None
+
     def append_event(self, *, turn_id: str, session_id: str, event_type: GatewayEventType, payload=None, expected_claim_generation: int | None = None) -> GatewayEvent:
         with self._runtime_begin() as c:
             current_generation = c.execute(
@@ -360,7 +481,28 @@ class MySQLGatewayRepository:
     def list_turns(self, session_id: str, *, limit: int = 100) -> list[TurnRecord]:
         with self._engine.connect() as c:
             rows = c.execute(text("SELECT * FROM nlp_turns WHERE conversation_id=:s ORDER BY created_at DESC LIMIT :limit"), {"s": session_id, "limit": min(max(1, limit), 500)}).mappings().all()
-        return [self._record(dict(r)) for r in rows]
+            active_queued = c.execute(
+                text(
+                    "SELECT id,ROW_NUMBER() OVER (ORDER BY created_at,id) AS position, "
+                    "TIMESTAMPDIFF(SECOND,created_at,UTC_TIMESTAMP(6)) AS waited_s "
+                    "FROM nlp_turns WHERE status='accepted'"
+                )
+            ).mappings().all()
+        queue_by_id = {
+            str(row["id"]): {
+                "queue_position": int(row["position"]),
+                "waited_s": max(0, int(row["waited_s"])),
+            }
+            for row in active_queued
+        }
+        result = []
+        for row in rows:
+            record = self._record(dict(row))
+            queue_state = queue_by_id.get(record.turn_id)
+            result.append(
+                record.model_copy(update=queue_state) if queue_state else record
+            )
+        return result
 
     def list_question_turns(self, *, workspace_id: str, since: str, timezone_name: str = "UTC") -> list[dict[str, Any]]:
         """Teacher read model: structured question rows for analytics.
@@ -911,6 +1053,273 @@ class MySQLGatewayRepository:
     def health(self):
         with self._engine.connect() as c: count = int(c.execute(text("SELECT COUNT(*) FROM nlp_turn_events")).scalar_one())
         return {"database": "mysql", "durable_events": count}
+
+    def reconcile_capacity(self) -> dict[str, Any]:
+        """Repair the persisted admission counters while serializing Turn writers."""
+        with self._engine.begin() as connection:
+            capacity = connection.execute(
+                text(
+                    "SELECT queued_count,running_count FROM nlp_runtime_capacity "
+                    "WHERE scope_key='global:turns' FOR UPDATE"
+                )
+            ).mappings().one()
+            actual = connection.execute(
+                text(
+                    "SELECT COALESCE(SUM(status='accepted'),0) AS queued_count, "
+                    "COALESCE(SUM(status='running'),0) AS running_count "
+                    "FROM nlp_turns"
+                )
+            ).mappings().one()
+            actual_users = {
+                str(row["user_id"]): int(row["active_count"])
+                for row in connection.execute(
+                    text(
+                        "SELECT user_id,COUNT(*) AS active_count FROM nlp_turns "
+                        "WHERE status IN ('accepted','running') GROUP BY user_id"
+                    )
+                ).mappings()
+            }
+            stored_users = {
+                str(row["user_id"]): int(row["active_count"])
+                for row in connection.execute(
+                    text("SELECT user_id,active_count FROM nlp_turn_user_capacity")
+                ).mappings()
+            }
+            drift_detected = (
+                int(capacity["queued_count"]) != int(actual["queued_count"])
+                or int(capacity["running_count"]) != int(actual["running_count"])
+                or stored_users != actual_users
+            )
+            connection.execute(text("DELETE FROM nlp_turn_user_capacity"))
+            if actual_users:
+                connection.execute(
+                    text(
+                        "INSERT INTO nlp_turn_user_capacity(user_id,active_count) "
+                        "VALUES(:user_id,:active_count)"
+                    ),
+                    [
+                        {"user_id": user_id, "active_count": active_count}
+                        for user_id, active_count in actual_users.items()
+                    ],
+                )
+            connection.execute(
+                text(
+                    "UPDATE nlp_runtime_capacity SET queued_count=:queued, "
+                    "running_count=:running, last_reconciled_at=UTC_TIMESTAMP(6), "
+                    "updated_at=UTC_TIMESTAMP(6) WHERE scope_key='global:turns'"
+                ),
+                {"queued": actual["queued_count"], "running": actual["running_count"]},
+            )
+        return {
+            "queued_count": int(actual["queued_count"]),
+            "running_count": int(actual["running_count"]),
+            "active_users": len(actual_users),
+            "drift_detected": drift_detected,
+        }
+
+    def capacity_snapshot(self) -> dict[str, Any]:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT queued_count,running_count,queue_capacity,"
+                    "per_user_active_limit,last_reconciled_at FROM nlp_runtime_capacity "
+                    "WHERE scope_key='global:turns'"
+                )
+            ).mappings().one()
+            oldest_wait_s = connection.execute(
+                text(
+                    "SELECT COALESCE(TIMESTAMPDIFF(SECOND,MIN(created_at),UTC_TIMESTAMP(6)),0) "
+                    "FROM nlp_turns WHERE status='accepted'"
+                )
+            ).scalar_one()
+        return {
+            "queued_count": int(row["queued_count"]),
+            "running_count": int(row["running_count"]),
+            "queue_capacity": int(row["queue_capacity"]),
+            "per_user_active_limit": int(row["per_user_active_limit"]),
+            "oldest_queued_wait_s": int(oldest_wait_s),
+            "last_reconciled_at": row["last_reconciled_at"],
+        }
+
+    def operational_metrics(self) -> dict[str, Any]:
+        """Return bounded-cardinality runtime counters for operator views."""
+        capacity = self.capacity_snapshot()
+        with self._engine.connect() as connection:
+            quota = connection.execute(
+                text(
+                    "SELECT COALESCE(SUM(reserved_tokens),0) AS reserved_tokens, "
+                    "COALESCE(SUM(unknown_usage_events),0) AS unknown_usage_events "
+                    "FROM nlp_model_quota_accounts"
+                )
+            ).mappings().one()
+            quota_leaks = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM nlp_model_quota_reservations r "
+                        "LEFT JOIN nlp_turns t ON t.id=r.turn_id "
+                        "WHERE r.status='reserved' AND "
+                        "(t.id IS NULL OR t.status NOT IN ('accepted','running'))"
+                    )
+                ).scalar_one()
+            )
+            pending_outbox = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM nlp_outbox_messages "
+                        "WHERE topic='turn.dispatch' AND status='pending'"
+                    )
+                ).scalar_one()
+            )
+            recoveries_1h = int(
+                connection.execute(
+                    text(
+                        "SELECT COUNT(*) FROM nlp_turn_events WHERE event_type='turn.handover' "
+                        "AND created_at>=UTC_TIMESTAMP(6)-INTERVAL 1 HOUR"
+                    )
+                ).scalar_one()
+            )
+        pool = self._engine.pool
+        return {
+            "queue": capacity,
+            "outbox_pending": pending_outbox,
+            "recoveries_last_hour": recoveries_1h,
+            "quota": {
+                "reserved_tokens": int(quota["reserved_tokens"]),
+                "unknown_usage_events": int(quota["unknown_usage_events"]),
+                "leaked_reservations": quota_leaks,
+            },
+            "database_sync_pool": {
+                "size": int(pool.size()),
+                "checked_out": int(pool.checkedout()),
+                "overflow": int(pool.overflow()),
+                "checked_in": int(pool.checkedin()),
+                "timeout_s": int(getattr(pool, "_timeout", 0)),
+            },
+        }
+
+    def reconcile_model_quota(self) -> dict[str, int | bool]:
+        """Release reservations whose durable Turn is already terminal or gone.
+
+        Lock ordering mirrors Turn settlement and usage reporting:
+        Turn -> Reservation -> Account. Account counters are then checked
+        against the reservation rows, never silently clamped.
+        """
+        released = 0
+        with self._engine.begin() as connection:
+            candidates = connection.execute(
+                text(
+                    "SELECT id,turn_id FROM nlp_model_quota_reservations "
+                    "WHERE status='reserved' ORDER BY created_at,id"
+                )
+            ).mappings().all()
+            for candidate in candidates:
+                turn = connection.execute(
+                    text("SELECT status FROM nlp_turns WHERE id=:turn FOR UPDATE"),
+                    {"turn": candidate["turn_id"]},
+                ).mappings().first()
+                if turn is not None and turn["status"] in {"accepted", "running"}:
+                    continue
+                reservation = connection.execute(
+                    text(
+                        "SELECT id,user_id,reserved_tokens,unknown_usage_events,status "
+                        "FROM nlp_model_quota_reservations WHERE id=:id FOR UPDATE"
+                    ),
+                    {"id": candidate["id"]},
+                ).mappings().first()
+                if reservation is None or reservation["status"] != "reserved":
+                    continue
+                account = connection.execute(
+                    text(
+                        "SELECT reserved_tokens FROM nlp_model_quota_accounts "
+                        "WHERE user_id=:user FOR UPDATE"
+                    ),
+                    {"user": reservation["user_id"]},
+                ).mappings().first()
+                amount = int(reservation["reserved_tokens"])
+                if account is None or int(account["reserved_tokens"]) < amount:
+                    raise RuntimeError("model quota reservation counter underflow")
+                connection.execute(
+                    text(
+                        "UPDATE nlp_model_quota_accounts SET reserved_tokens=reserved_tokens-:tokens, "
+                        "updated_at=UTC_TIMESTAMP(6) WHERE user_id=:user"
+                    ),
+                    {"tokens": amount, "user": reservation["user_id"]},
+                )
+                final_status = (
+                    "unknown_usage"
+                    if int(reservation["unknown_usage_events"]) > 0
+                    else ("settled" if turn is not None else "released")
+                )
+                connection.execute(
+                    text(
+                        "UPDATE nlp_model_quota_reservations SET status=:status, "
+                        "finalized_at=UTC_TIMESTAMP(6) WHERE id=:id AND status='reserved'"
+                    ),
+                    {"status": final_status, "id": reservation["id"]},
+                )
+                released += 1
+
+            actual = {
+                str(row["user_id"]): int(row["reserved_tokens"])
+                for row in connection.execute(
+                    text(
+                        "SELECT user_id,SUM(reserved_tokens) AS reserved_tokens "
+                        "FROM nlp_model_quota_reservations WHERE status='reserved' "
+                        "GROUP BY user_id"
+                    )
+                ).mappings()
+            }
+            accounts = connection.execute(
+                text(
+                    "SELECT user_id,reserved_tokens FROM nlp_model_quota_accounts "
+                    "FOR UPDATE"
+                )
+            ).mappings().all()
+            drifted_accounts = 0
+            for account in accounts:
+                expected = actual.get(str(account["user_id"]), 0)
+                if int(account["reserved_tokens"]) == expected:
+                    continue
+                connection.execute(
+                    text(
+                        "UPDATE nlp_model_quota_accounts SET reserved_tokens=:tokens, "
+                        "updated_at=UTC_TIMESTAMP(6) WHERE user_id=:user"
+                    ),
+                    {"tokens": expected, "user": account["user_id"]},
+                )
+                drifted_accounts += 1
+        return {
+            "released_orphan_reservations": released,
+            "reserved_counter_drifted_accounts": drifted_accounts,
+            "reserved_tokens": sum(actual.values()),
+            "drift_detected": bool(released or drifted_accounts),
+        }
+
+    def queue_position(self, turn_id: str) -> dict[str, int] | None:
+        with self._engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT position,waited_s FROM ("
+                    "SELECT target.id, "
+                    "SUM(CASE WHEN queued.status='accepted' AND "
+                    "(queued.created_at < target.created_at OR "
+                    "(queued.created_at = target.created_at AND queued.id <= target.id)) "
+                    "THEN 1 ELSE 0 END) AS position, "
+                    "TIMESTAMPDIFF(SECOND,target.created_at,UTC_TIMESTAMP(6)) AS waited_s "
+                    "FROM nlp_turns target JOIN nlp_turns queued "
+                    "ON queued.status='accepted' "
+                    "WHERE target.id=:turn_id AND target.status='accepted' "
+                    "GROUP BY target.id,target.created_at"
+                    ") queue_state"
+                ),
+                {"turn_id": turn_id},
+            ).mappings().first()
+        if row is None:
+            return None
+        return {
+            "queue_position": int(row["position"]),
+            "waited_s": max(0, int(row["waited_s"])),
+        }
 
     # Normalized teaching read/write path. The compat projection is deliberately
     # not consulted: catalog revision and entity rows are authoritative here.
