@@ -61,6 +61,12 @@ class MySQLGatewayRepository:
         self._runtime_lock_enabled = True
         self.knowledge_point_prompt_budget = max(1, knowledge_point_prompt_budget)
         self.quota_service = QuotaService(self._engine) if quota_enforcement else None
+        deployment_env = settings.NLP_AGENT_DEPLOYMENT_ENV.strip().lower()
+        self._test_model_quota_tokens = (
+            settings.NLP_AGENT_TEST_MODEL_QUOTA_TOKENS
+            if deployment_env in {"test", "testing"}
+            else None
+        )
 
     def _runtime_begin(self):
         return runtime_write_transaction(
@@ -147,6 +153,8 @@ class MySQLGatewayRepository:
         user_id: str,
         workspace_id: str,
         reserved_tokens: int,
+        model_profile: str | None,
+        default_quota_tokens: int | None,
     ) -> None:
         estimate = max(0, int(reserved_tokens))
         existing = connection.execute(
@@ -162,22 +170,25 @@ class MySQLGatewayRepository:
             return
         connection.execute(
             text(
-                "INSERT INTO nlp_model_quota_accounts(user_id) VALUES(:user) "
-                "ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)"
+                "INSERT INTO nlp_model_quota_accounts(user_id,token_limit,quota_tokens) "
+                "VALUES(:user,:quota,:quota) ON DUPLICATE KEY UPDATE "
+                "token_limit=COALESCE(token_limit,VALUES(token_limit)), "
+                "quota_tokens=COALESCE(quota_tokens,VALUES(quota_tokens))"
             ),
-            {"user": user_id},
+            {"user": user_id, "quota": default_quota_tokens},
         )
         account = connection.execute(
             text(
-                "SELECT quota_tokens,reserved_tokens,consumed_tokens "
+                "SELECT COALESCE(token_limit,quota_tokens) AS token_limit,"
+                "reserved_tokens,GREATEST(used_tokens,consumed_tokens) AS used_tokens "
                 "FROM nlp_model_quota_accounts WHERE user_id=:user FOR UPDATE"
             ),
             {"user": user_id},
         ).mappings().one()
-        quota = account["quota_tokens"]
+        quota = account["token_limit"]
         if quota is not None and (
             int(account["reserved_tokens"])
-            + int(account["consumed_tokens"])
+            + int(account["used_tokens"])
             + estimate
             > int(quota)
         ):
@@ -193,9 +204,11 @@ class MySQLGatewayRepository:
             connection.execute(
                 text(
                     "UPDATE nlp_model_quota_reservations SET reserved_tokens=:tokens, "
-                    "status='reserved',finalized_at=NULL WHERE id=:id"
+                    "model_profile=COALESCE(:profile,model_profile),settled_tokens=0,"
+                    "status='reserved',expires_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 1 DAY),"
+                    "finalized_at=NULL WHERE id=:id"
                 ),
-                {"tokens": estimate, "id": reservation_id},
+                {"tokens": estimate, "profile": model_profile, "id": reservation_id},
             )
             return
         connection.execute(
@@ -208,14 +221,16 @@ class MySQLGatewayRepository:
         connection.execute(
             text(
                 "INSERT INTO nlp_model_quota_reservations "
-                "(id,user_id,workspace_id,turn_id,reserved_tokens,status) "
-                "VALUES(:id,:user,:workspace,:turn,:tokens,'reserved')"
+                "(id,user_id,workspace_id,turn_id,model_profile,reserved_tokens,expires_at,status) "
+                "VALUES(:id,:user,:workspace,:turn,:profile,:tokens,"
+                "DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 1 DAY),'reserved')"
             ),
             {
                 "id": reservation_id,
                 "user": user_id,
                 "workspace": workspace_id,
                 "turn": turn_id,
+                "profile": model_profile,
                 "tokens": estimate,
             },
         )
@@ -244,6 +259,7 @@ class MySQLGatewayRepository:
         dispatch_payload: str | None = None,
         quota_reservation_id: str | None = None,
         reserved_tokens: int = 0,
+        model_profile: str | None = None,
         quota_admission: AdmitTurn | None = None,
         quota_role_codes: tuple[str, ...] = (),
         quota_classroom_ids: tuple[str, ...] = (),
@@ -1051,8 +1067,18 @@ class MySQLGatewayRepository:
         return {"compacted": int(compacted or 0), "capped": 0, "remaining": remaining}
     def flush(self) -> None: return None
     def health(self):
-        with self._engine.connect() as c: count = int(c.execute(text("SELECT COUNT(*) FROM nlp_turn_events")).scalar_one())
-        return {"database": "mysql", "durable_events": count}
+        with self._engine.connect() as c:
+            count = int(c.execute(text("SELECT COUNT(*) FROM nlp_turn_events")).scalar_one())
+            running_turns = int(
+                c.execute(
+                    text("SELECT COUNT(*) FROM nlp_turns WHERE status='running'")
+                ).scalar_one()
+            )
+        return {
+            "database": "mysql",
+            "durable_events": count,
+            "running_turns": running_turns,
+        }
 
     def reconcile_capacity(self) -> dict[str, Any]:
         """Repair the persisted admission counters while serializing Turn writers."""
@@ -1194,6 +1220,7 @@ class MySQLGatewayRepository:
                 "overflow": int(pool.overflow()),
                 "checked_in": int(pool.checkedin()),
                 "timeout_s": int(getattr(pool, "_timeout", 0)),
+                "checkout_latency": pool.checkout_metrics(),
             },
         }
 
@@ -1253,6 +1280,7 @@ class MySQLGatewayRepository:
                 connection.execute(
                     text(
                         "UPDATE nlp_model_quota_reservations SET status=:status, "
+                        "settled_tokens=used_tokens,expires_at=NULL,"
                         "finalized_at=UTC_TIMESTAMP(6) WHERE id=:id AND status='reserved'"
                     ),
                     {"status": final_status, "id": reservation["id"]},

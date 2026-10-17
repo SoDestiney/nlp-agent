@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,13 +15,35 @@ from gateway.mysql_repository import MySQLGatewayRepository
 from gateway.turn_execution import InProcessTurnExecutor
 
 
-def _task(turn_id: str = "turn-1") -> TurnTask:
+def _task(
+    turn_id: str = "turn-1", quota_reservation_id: str | None = None
+) -> TurnTask:
     return TurnTask(
         context=SessionContext(session_id="session-1"), turn_id=turn_id,
         content="hello", learning_context=None, learning_progress=None,
         exercise_state=None, teaching_materials=TeachingMaterials(),
         guided_session_id=None, exercise_session_id=None,
+        quota_reservation_id=quota_reservation_id,
     )
+
+
+def test_legacy_task_requires_and_uses_its_durable_quota_reservation():
+    from gateway.dispatch import require_durable_quota_reservation
+    from gateway.redis_transport import TurnTaskCodec
+
+    legacy_payload = json.loads(TurnTaskCodec.dumps(_task()))
+    legacy_payload.pop("quota_reservation_id")
+    legacy = TurnTaskCodec.loads(json.dumps(legacy_payload))
+    recovered = require_durable_quota_reservation(legacy, "reservation-1")
+
+    assert recovered.quota_reservation_id == "reservation-1"
+    assert legacy.quota_reservation_id is None
+    with pytest.raises(ValueError, match="no durable model quota reservation"):
+        require_durable_quota_reservation(legacy, None)
+    with pytest.raises(ValueError, match="does not match durable Turn"):
+        require_durable_quota_reservation(
+            _task(quota_reservation_id="reservation-stale"), "reservation-1"
+        )
 
 
 @pytest.mark.parametrize("write", ["status", "event", "learning"])
@@ -273,7 +296,10 @@ def test_lease_expiring_between_lock_and_write_rejects_actual_sql_write(write):
 
     def execute(statement, _parameters=None):
         result = MagicMock()
-        result.mappings.return_value.first.return_value = {"id": "turn-1", "user_id": "user-1", "result_text": None, "error_message": None}
+        result.mappings.return_value.first.return_value = {
+            "id": "turn-1", "user_id": "user-1", "result_text": None,
+            "error_message": None, "status": "running", "workspace_id": "ws-1",
+        }
         result.scalar_one.return_value = 1
         result.rowcount = 0
         return result

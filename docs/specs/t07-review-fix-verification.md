@@ -1,10 +1,10 @@
 # T07 复审修复与验证记录
 
-日期：2026-10-17。状态：六项复审 P1 的历史修复与本轮开发侧补齐均有代码；T07 整体验收未完成，不可据此部署。
+日期：2026-10-17。状态：开发侧已继续补齐接单/额度账本审查缺口；T07 整体验收未完成，不可据此部署。
 
-以下标注为此前日期的执行记录属于历史快照；当前代码与验证状态以“2026-10-17 开发侧补齐”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
+以下旧结果均为历史快照；当前代码与验证状态以“2026-10-17 复审缺口续修”及文末“未完成与未验证”为准。历史通过结果不代表本轮代码在真实环境复验通过。
 
-## 2026-10-17 开发侧补齐
+## 历史记录：2026-10-17 首轮开发侧补齐
 
 在 Docker/真实数据库验收之前，已继续实现以下开发内容：
 
@@ -22,6 +22,29 @@
 - Alembic 图解析：唯一 head 为 `20261016_52_t07`。这不是执行迁移。
 - 异步 Worker fence 测试在 Windows 测试运行器创建 asyncio event loop 时卡于系统 socketpair 初始化，已中断；不计作通过。前端测试/类型检查依赖在该隔离工作区不完整，未运行。
 - 本轮未启动 Docker、MySQL、Redis、Provider 或真实课堂负载；未生成新的 baseline/final/comparison，也未修改 Compose 扩容配置。
+
+## 2026-10-17 复审缺口续修
+
+本轮继续处理已提交开发代码的复审项，没有启动 Docker：
+
+- 额度估算器返回 `None` 时，不再用短输入文本的粗略 token 估算兜底；按 coordinator 可选模型的最大输入上下文加最大输出上限预留。定向回归原先以 260 tokens 通过，修复后预期为 32,256 tokens。
+- Worker 执行前从持久 Turn 读取 Reservation ID。旧版 v1 Redis payload 缺少该字段时从数据库补齐；持久 Reservation 缺失或 payload 与 Turn 不匹配时拒绝执行，不能无额度账本运行。
+- Gateway `active_turns` 使用数据库运行态计数；`worker_active_slots` 汇总仍有效的 Worker heartbeat。Outbox 提交只代表排队，不再错误计为执行中。
+- 新增 revision `20261017_53_t07` 和 ORM 字段：账户 `token_limit`/窗口/`used_tokens`，Reservation `model_profile`/`settled_tokens`/`expires_at`，Usage Event `pricing_version`/`charge_units`。终态与对账会固化实际结算用量。
+- 新增 `NLP_AGENT_TEST_MODEL_QUOTA_TOKENS`；只在 `NLP_AGENT_DEPLOYMENT_ENV=test|testing` 为新建或尚未配置额度的账户设默认额度，生产仍可保持无限额度并继续完整记账。
+- 新增同步与异步 SQLAlchemy queue pool 的 acquisition 观测：当前 pending checkout、acquire count/sum/max、固定延迟桶和 timeout 计数，并接入运行时 pool 指标；通过无 MySQL 的慢连接/池耗尽测试验证采集逻辑，不代表真实 MySQL 连接池已经运行验收。
+
+本轮可在当前环境运行的验证：
+
+- 最近一次同步回归集合：**50 passed, 24 deselected**。命令包含 admission/helper、迁移图、usage contracts、T07 review regressions、Turn reliability、Worker fencing 和 pool metrics；`-m 'not asyncio'` 明确排除 24 个带 `asyncio` marker 的用例，不等价于完整后端通过。单例 WebSocket 复测的本地 event-loop 阻塞见下项。
+- T07 admission/helper、迁移图和 model usage 非异步合同测试：**31 passed, 1 deselected**。
+- 旧 v1 payload Reservation 补齐回归：**1 passed**。
+- Worker fence/连接池/Compose 预算等同步回归：此前选择集 **7 passed**；该选择集未覆盖本轮新增迁移实际执行。
+- Ruff、compileall、迁移图解析和 diff whitespace 检查：通过；当前唯一 Alembic head 为 `20261017_53_t07`。仅图解析，不代表运行了 SQL 迁移。
+- `test_fenced_executor_claims_turn_before_invoking_agent` 在 Windows asyncio loop 初始化处超过 30 秒无输出，已中断；尝试 Selector loop 仍然卡住，**未验证，不计通过**。
+- 当前再次尝试 `tests/test_web_api.py::test_websocket_reports_deleted_session_subscription_without_crashing` 时，在 `TestClient.__enter__ → anyio.start_blocking_portal → asyncio.new_event_loop → socketpair` 阶段挂住。`-o faulthandler_timeout=10` 的堆栈显示卡在 Windows `socket._fallback_socketpair()` 的 `accept()`，还未进入 WebSocket endpoint；Selector policy 同样卡在 `selector_events._make_self_pipe()`。这是本机测试运行器阻塞，不能当作 `CancelledError` 的新复现，也没有据此改 WebSocket 逻辑。
+- `tests/test_mysql_pool_metrics.py`：**3 passed**，覆盖 acquire latency/timeout histogram、并发 pending checkout，以及同步/异步 engine factory 的 pool 接线；不访问 MySQL，已包含在最近一次 50 项通过中。
+- 未启动 Docker/MySQL/Redis，没有执行新迁移、DB 并发/事务测试、前端检查或负载测试；没有新的 baseline/final/comparison。
 
 ## 后续推进：WebSocket 取消与真实基线
 
@@ -205,12 +228,12 @@ python -m pytest tests/api_http/auth/test_registration_core.py tests/api_http/au
 
 ## 未完成与未验证
 
-1. Admission 触发器、额度 Reservation/Usage ledger、触发器终态释放以及 pool/runtime 指标均尚未在真实 MySQL 执行迁移或集成验证；静态检查和单测不能证明 SQL 并发语义、触发器回滚或容量计数无漂移。
+1. Admission 计数、额度 Reservation/Usage ledger、终态释放与 `20261017_53_t07` 均已实现代码，但本轮没有在真实 MySQL 执行迁移或集成验证；静态检查和单测不能证明 SQL 并发语义、触发器回滚或容量计数无漂移。
 2. 后台 Worker 目前在 fenced Turn 中禁止脱离式运行，但尚无独立持久任务表、接单/lease/取消/终态及恢复链路。工具副作用也尚未全面绑定持久 operation ID 与 generation，因此不满足双 Worker 的 exactly-once 启用前提。
-3. 指标提供当前 pool 使用量和配置 timeout，但尚未采集数据库连接等待时长/分位数；队列深度、最老任务、执行槽、恢复和额度泄漏指标也尚未接入生产监控告警。
+3. 指标已提供 pool 使用量、pending checkout、acquire latency 固定桶/最大值/超时，以及队列/执行槽/恢复/额度状态；尚未在真实 MySQL 上验证采集表现，也未补 statement/lock/deadlock 指标和生产监控告警接入。
 4. 前端排队显示/取消/重连恢复已实现代码，但本轮没有可用完整的前端依赖目录，未运行类型检查、测试或 build。
 5. 尚无冻结旧版本 50 登录/30 Turn 基线、同参 final/comparison、`1×1 → 1×4 → 2×4`、Worker 强杀、Redis pause、DB delay、慢短信、额度耗尽和 Provider 错误完整故障矩阵结果。
 6. 本地 pytest 的异步用例受 Windows 事件循环 socketpair 初始化阻塞；真实数据库/HTTP 测试尚未运行。历史全量回归曾有 36 项在冻结版本复现的旧失败，另外存在过时记录的偶发项；需按当前代码重新采集全量结果。
 7. 因上述实现/验证缺口，T07 仍不可部署或扩容。Compose 继续保持 1×1；不得把未运行的迁移、前端或真实负载验证描述为通过。
 
-下一阶段应先完成权威 Admission/模型额度账本及 background 生命周期，再执行完整隔离故障验收；在此之前不扩容生产。
+下一阶段先补独立后台任务 lease/取消/恢复与副作用幂等 fence，再补 statement/lock/deadlock 指标及告警；随后需要恢复可运行的 Windows 测试事件循环并执行新迁移、真实数据库并发与故障注入验收。在此之前 Compose 保持 1×1，不扩容生产。

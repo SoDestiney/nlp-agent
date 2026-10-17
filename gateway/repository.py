@@ -304,6 +304,7 @@ class GatewayRepository:
         quota_admission: Any = None,
         quota_role_codes: tuple[str, ...] = (),
         quota_classroom_ids: tuple[str, ...] = (),
+        model_profile: str | None = None,
     ) -> tuple[TurnRecord, bool]:
         with self._lock, self._conn:
             if idempotency_key:
@@ -356,6 +357,7 @@ class GatewayRepository:
         error_message: str | None = None,
         exercise_state: ExerciseState | None = None,
         dispatch_payload: str | None = None,
+        model_profile: str | None = None,
     ) -> TurnRecord:
         fields: dict[str, Any] = {
             "status": status.value,

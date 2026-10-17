@@ -20,7 +20,8 @@ from server.rbac.catalog import permission_id, permission_row, role_id
 def test_migration_graph_has_one_deployable_head_after_t07_additions() -> None:
     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
 
-    assert scripts.get_heads() == ["20261016_52_t07"]
+    assert scripts.get_heads() == ["20261017_53_t07"]
+    assert scripts.get_revision("20261017_53_t07").down_revision == "20261016_52_t07"
     assert scripts.get_revision("20261016_52_t07").down_revision == "20261016_51_t07"
     assert scripts.get_revision("20261016_51_t07").down_revision == "20261016_50_t06"
     assert scripts.get_revision("20261016_50_t06").down_revision == "20261015_49_t06"

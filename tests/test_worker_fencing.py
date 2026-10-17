@@ -32,13 +32,16 @@ async def test_fenced_executor_claims_turn_before_invoking_agent(monkeypatch) ->
     factory.begin.return_value = unit_of_work
     reliability = AsyncMock()
     reliability.claim_turn.return_value = 4
+    reliability.quota_reservation_for_turn.return_value = "reservation-1"
     captured_fences = []
     captured_contexts = []
+    captured_tasks = []
 
-    async def execute(_task, context):
+    async def execute(task, context):
         from gateway.execution_fence import current_turn_write_fence
 
         assert current_turn_execution_context() is context
+        captured_tasks.append(task)
         captured_contexts.append(context)
         captured_fences.append(current_turn_write_fence())
     principal = AuthenticatedPrincipal(
@@ -74,6 +77,10 @@ async def test_fenced_executor_claims_turn_before_invoking_agent(monkeypatch) ->
         workspace_id="default",
     )
     unit_of_work.commit.assert_awaited_once()
+    reliability.quota_reservation_for_turn.assert_awaited_once_with(
+        session, turn_id="turn-1"
+    )
+    assert captured_tasks[0].quota_reservation_id == "reservation-1"
     execution = captured_contexts[0]
     assert execution.turn_id == "turn-1"
     assert execution.claim_generation == 4
@@ -144,6 +151,7 @@ async def test_fenced_executor_cancels_execution_when_heartbeat_loses_claim(
     factory.begin.return_value = unit_of_work
     reliability = AsyncMock()
     reliability.claim_turn.return_value = 1
+    reliability.quota_reservation_for_turn.return_value = "reservation-1"
     reliability.heartbeat.side_effect = LostTurnClaimError("claim moved")
     principal = AuthenticatedPrincipal(
         user_id="user-1",
@@ -174,6 +182,7 @@ async def test_fenced_executor_cancels_execution_when_heartbeat_loses_claim(
         guided_session_id=None,
         exercise_session_id=None,
         authorization=ExecutionAuthorizationContext("user-1", "default", 3),
+        quota_reservation_id="reservation-1",
     )
     executor = FencedTurnExecutor(
         factory, reliability, execute, worker_id="worker-a", lease_s=3

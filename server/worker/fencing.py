@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
-from gateway.dispatch import TurnTask
+from gateway.dispatch import TurnTask, require_durable_quota_reservation
 from gateway.execution_fence import TurnWriteFence, bind_turn_write_fence
 from core.rbac import Permission, authorization_service
 from core.rbac import required_permission_for_high_risk_tool
@@ -110,6 +110,10 @@ class FencedTurnExecutor:
                 permission_code=Permission.AGENT_TURN_SUBMIT.value, resource_type="turn",
                 resource_id=task.turn_id,
             )
+            durable_reservation_id = await self._reliability.quota_reservation_for_turn(
+                unit_of_work.session, turn_id=task.turn_id
+            )
+            task = require_durable_quota_reservation(task, durable_reservation_id)
             await unit_of_work.commit()
 
         heartbeat = asyncio.create_task(

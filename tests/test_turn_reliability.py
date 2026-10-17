@@ -350,6 +350,9 @@ async def test_outbox_dispatcher_only_tracks_task_persisted_by_turn_repository()
 
     reliability = AsyncMock()
     transport = AsyncMock()
+    transport.worker_heartbeats.return_value = [
+        {"active_slots": 2}, {"active_slots": 1}
+    ]
     task = TurnTask(
         context=SessionContext(session_id="session-1"),
         turn_id="turn-1",
@@ -367,4 +370,7 @@ async def test_outbox_dispatcher_only_tracks_task_persisted_by_turn_repository()
 
     reliability.enqueue.assert_not_awaited()
     transport.submit.assert_not_awaited()
-    assert dispatcher.active_count() == 1
+    assert await dispatcher.worker_heartbeats() == [
+        {"active_slots": 2}, {"active_slots": 1}
+    ]
+    assert dispatcher.active_count() == 0

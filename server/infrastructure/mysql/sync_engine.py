@@ -11,6 +11,7 @@ from sqlalchemy import create_engine as sqlalchemy_create_engine
 from sqlalchemy.engine import Engine
 
 from .config import DatabaseConfig
+from .pool_metrics import MeasuredQueuePool
 
 _LOCK = RLock()
 _ENGINES: dict[tuple[int, str, str], tuple[Engine, int]] = {}
@@ -24,6 +25,7 @@ def create_engine(url: str, **options: Any) -> Engine:
             engine, references = current
             _ENGINES[key] = (engine, references + 1)
             return engine
+        options.setdefault("poolclass", MeasuredQueuePool)
         engine = sqlalchemy_create_engine(url, **options)
         _ENGINES[key] = (engine, 1)
         return engine

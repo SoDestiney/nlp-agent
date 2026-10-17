@@ -639,8 +639,12 @@ class ModelQuotaAccountModel(Base):
     __tablename__ = "nlp_model_quota_accounts"
     user_id: Mapped[str] = mapped_column(UUID, primary_key=True)
     quota_tokens: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
+    token_limit: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
+    window_started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    window_ends_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     consumed_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    used_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     unknown_usage_events: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
@@ -663,13 +667,16 @@ class ModelQuotaReservationModel(Base):
     )
     workspace_id: Mapped[str | None] = mapped_column(UUID)
     turn_id: Mapped[str] = mapped_column(UUID, nullable=False)
+    model_profile: Mapped[str | None] = mapped_column(String(64))
     reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
     used_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    settled_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     unknown_usage_events: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="reserved")
     created_at: Mapped[datetime] = mapped_column(
         DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
     )
+    expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     finalized_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
 
 
@@ -697,6 +704,8 @@ class ModelUsageEventModel(Base):
     preset: Mapped[str] = mapped_column(String(128), nullable=False)
     route: Mapped[str | None] = mapped_column(String(128))
     pricing_key: Mapped[str | None] = mapped_column(String(160))
+    pricing_version: Mapped[str | None] = mapped_column(String(64))
+    charge_units: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
     attempt: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
     fallback_index: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
     input_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)

@@ -74,6 +74,20 @@ logger = logging.getLogger(__name__)
 _WHITEBOARD_LIBRARY_MANAGER_ROLES = frozenset({"teacher", "developer", "admin"})
 
 
+def active_turn_count(durable_state: dict[str, Any] | None, *, fallback: int) -> int:
+    """Prefer the authoritative running count over locally submitted work."""
+    if durable_state is None or durable_state.get("running_turns") is None:
+        return max(0, int(fallback))
+    return max(0, int(durable_state["running_turns"]))
+
+
+def active_worker_slot_count(workers: list[dict[str, Any]] | None) -> int | None:
+    """Aggregate live Worker heartbeats; None means telemetry is unavailable."""
+    if workers is None:
+        return None
+    return sum(max(0, int(worker.get("active_slots", 0))) for worker in workers)
+
+
 def _estimate_turn_reservation_tokens(content: str, model_profile: str | None) -> int:
     """Reserve a conservative first-pass input estimate and coordinator output cap."""
     from core.model_runtime.factory import get_global_model_factory
@@ -93,7 +107,17 @@ def _estimate_turn_reservation_tokens(content: str, model_profile: str | None) -
             [{"role": "user", "content": content}]
         )
     if estimated_input is None:
-        estimated_input = rough_token_count_estimation(content)
+        context_limits = [
+            factory.config.models[
+                factory.config.model_presets[name].model
+            ].context_window_tokens
+            for name in preset_names
+        ]
+        if not context_limits:
+            raise RuntimeError("coordinator route has no model context limit")
+        # A failed estimator must not quietly fall back to a much smaller
+        # character heuristic: reserve the largest eligible input context.
+        estimated_input = max(context_limits)
     output_reserve = max(
         factory.config.model_presets[name].generation.max_output_tokens
         for name in preset_names
@@ -685,6 +709,7 @@ class BackendGateway:
             quota_classroom_ids=tuple(principal.classroom_ids),
             quota_reservation_id=quota_reservation_id,
             reserved_tokens=reserved_tokens,
+            model_profile=request.model_profile,
         )
         resubmitted = bool(
             duplicate
@@ -707,6 +732,7 @@ class BackendGateway:
                 dispatch_payload=TurnTaskCodec.dumps(task) if self._remote_execution else None,
                 quota_reservation_id=quota_reservation_id,
                 reserved_tokens=reserved_tokens,
+                model_profile=request.model_profile,
             )
         queue_state = await self._queue_state(turn.turn_id, TurnStatus.ACCEPTED)
         await self._emit(
@@ -1467,7 +1493,9 @@ class BackendGateway:
             status="ok" if self._started else "stopped",
             started=self._started,
             accepting_turns=self._accepting,
-            active_turns=self.dispatcher.active_count(),
+            active_turns=active_turn_count(
+                repository, fallback=self.dispatcher.active_count()
+            ),
             subscribers=self.events.subscriber_count,
             database=repository["database"],
             durable_events=repository["durable_events"],
@@ -1485,9 +1513,12 @@ class BackendGateway:
         worker_reader = getattr(self.dispatcher, "worker_heartbeats", None)
         if worker_reader is not None:
             metrics["workers"] = await worker_reader()
+            metrics["worker_active_slots"] = active_worker_slot_count(
+                metrics["workers"]
+            )
         else:
             metrics["workers"] = None
-        metrics["worker_active_slots"] = self.dispatcher.active_count()
+            metrics["worker_active_slots"] = self.dispatcher.active_count()
         return metrics
 
     async def close(self, *, force: bool = False) -> None:

@@ -56,6 +56,14 @@ class TurnReliabilityService:
         await session.flush()
         return message
 
+    async def quota_reservation_for_turn(
+        self, session: AsyncSession, *, turn_id: str
+    ) -> str | None:
+        reservation_id = await session.scalar(
+            select(TurnModel.quota_reservation_id).where(TurnModel.id == turn_id)
+        )
+        return str(reservation_id) if reservation_id else None
+
     async def claim_turn(
         self,
         session: AsyncSession,

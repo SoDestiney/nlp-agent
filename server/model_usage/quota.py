@@ -57,6 +57,8 @@ def _event_payload(
         "preset": identity.preset,
         "route": identity.route,
         "pricing_key": identity.pricing_key,
+        "pricing_version": getattr(identity, "pricing_version", None),
+        "charge_units": None,
         "attempt": invocation.attempt,
         "fallback_index": invocation.fallback_index,
         "input_tokens": usage.input_tokens,
@@ -139,6 +141,8 @@ class DurableQuotaUsageReporter:
                     preset=invocation.identity.preset,
                     route=invocation.identity.route,
                     pricing_key=invocation.identity.pricing_key,
+                    pricing_version=getattr(invocation.identity, "pricing_version", None),
+                    charge_units=None,
                     attempt=invocation.attempt,
                     fallback_index=invocation.fallback_index,
                     input_tokens=usage.input_tokens,
@@ -167,6 +171,7 @@ class DurableQuotaUsageReporter:
                         reservation.status = "unknown_usage"
             else:
                 account.consumed_tokens += usage.total_tokens
+                account.used_tokens += usage.total_tokens
                 if reservation is not None:
                     reservation.used_tokens += usage.total_tokens
 

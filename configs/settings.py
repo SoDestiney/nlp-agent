@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from dotenv import dotenv_values
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.runtime_config import load_runtime_config
@@ -80,6 +81,7 @@ class Settings(BaseSettings):
     NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S: float = 5.0
     NLP_AGENT_WORKER_HEARTBEAT_TTL_S: int = 15
     NLP_AGENT_TURN_CAPACITY_RECONCILE_INTERVAL_S: int = 60
+    NLP_AGENT_TEST_MODEL_QUOTA_TOKENS: int | None = Field(default=None, gt=0)
     NLP_AGENT_DB_CONNECT_TIMEOUT_S: int = 5
     NLP_AGENT_DB_STATEMENT_TIMEOUT_S: int = 30
     # Timezone used to bucket teacher-analytics hour/weekday and peak-hour

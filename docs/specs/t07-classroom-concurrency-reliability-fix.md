@@ -8,15 +8,16 @@
 >
 > 最后核对日期：2026-10-15
 
-## 0. 复审修复状态（2026-10-16）
+## 0. 实施与验收状态（更新于 2026-10-17）
 
 本规格是目标，不表示所有阶段已经交付。当前独立实施分支为
 `codex/t07-reliability-fixes`，产品基点为 `8e83a7296a534504f6f5ef4320046d734412142b`。
-本轮首先修复复审列出的六项 P1，并补实际数据库和 HTTP 回归。
-详见 [复审修复验证记录](t07-review-fix-verification.md)。
+代码已覆盖 MySQL 权威容量计数、额度 Reservation/Usage Ledger、排队 UI、Worker
+heartbeat 指标，以及同步/异步连接池占用与 acquire 延迟观测；具体验证边界见
+[复审修复验证记录](t07-review-fix-verification.md)。
 
-仍未完成：MySQL 权威容量计数与用户上限、模型 Reservation/Usage Ledger
-及全部终态释放、排队 UI、完整监控指标、detached background resume 的权威任务生命周期、
+仍未完成：detached background resume 的独立持久任务生命周期、工具副作用的持久
+幂等 fence、statement/lock/deadlock 观测与告警接入，以及 MySQL 迁移/并发运行验证、
 旧版本 50/30 压测与 1×1 → 1×4 → 2×4 故障验收。因此 T07 尚不能标记完成或部署就绪。
 
 ## 1. 执行指令
@@ -331,7 +332,7 @@ MySQL `max_connections` 至少 100；所有应用理论最大连接总数不得�
 
 ### 9.3 指标
 
-增加 DB pool checked-out、overflow、pending、wait、timeout、statement latency、deadlock，以及 turn queue depth/oldest age/wait、worker slots、recoveries。不得把 user/session/turn/classroom ID 放进全局 metric label。
+增加 DB pool checked-out、overflow、pending checkout 数、acquire latency（count/sum/max/固定延迟桶）、timeout，以及 statement latency、deadlock；同时观测 turn queue depth/oldest age/wait、worker slots、recoveries。不得把 user/session/turn/classroom ID 放进全局 metric label。
 
 ## 10. 阶段 5：模型额度预留、结算与释放
 
