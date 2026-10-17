@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import asyncio
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
@@ -29,10 +31,17 @@ from server.infrastructure.mysql.models import (
     TurnModel,
 )
 from gateway.contracts import AdmissionLimitError
+from gateway.execution_fence import TurnWriteFence
 from server.model_usage.journal import UsageJournal
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _DispatchPermit:
+    fence: TurnWriteFence
+    deadline: float
 
 
 def _utc_naive(value):
@@ -96,6 +105,7 @@ class DurableQuotaUsageReporter:
         self._session_factory = session_factory
         self.journal = UsageJournal(journal_directory)
         self.preparation_timeout_s = preparation_timeout_s
+        self._dispatch_permits: dict[str, _DispatchPermit] = {}
 
     @staticmethod
     async def _lock_capacity(session: AsyncSession) -> None:
@@ -112,14 +122,15 @@ class DurableQuotaUsageReporter:
             TurnModel.id == invocation.attribution.turn_id
         ).with_for_update())
 
-    @staticmethod
-    def check_dispatch(invocation: ModelInvocation) -> None:
+    def check_dispatch(self, invocation: ModelInvocation) -> None:
         """No-await local fence check immediately before Provider dispatch."""
         if invocation.attribution.reservation_id:
             from gateway.execution_fence import LostTurnClaimError, current_turn_write_fence
 
             fence = current_turn_write_fence()
-            if fence is None:
+            permit = self._dispatch_permits.pop(invocation.operation_id, None)
+            if (fence is None or permit is None or permit.fence is not fence
+                or time.monotonic() >= permit.deadline):
                 raise LostTurnClaimError(invocation.attribution.turn_id)
             fence.require_valid(invocation.attribution.turn_id)
 
@@ -131,6 +142,7 @@ class DurableQuotaUsageReporter:
         if not bound or not output:
             raise ValueError("durable model calls require context and output limits")
         budget = bound + output
+        permit = None
         # This deadline covers pool/row-lock acquisition and preparation SQL,
         # independently of Provider timeouts. Exit it before committing: a
         # cancelled preparation rolls back, rather than cancelling a COMMIT
@@ -181,10 +193,15 @@ class DurableQuotaUsageReporter:
                     raise AdmissionLimitError(AdmissionLimitError.MODEL_QUOTA_EXCEEDED)
                 # The locking intent read above can also wait. Recheck lease and
                 # the shared local fence at the last asynchronous boundary.
+                clock_anchor = time.monotonic()
                 now = await session.scalar(select(func.utc_timestamp(6)))
                 fence.require_valid(attr.turn_id)
                 if turn.lease_expires_at <= now:
                     raise LostTurnClaimError(attr.turn_id)
+                # Anchor BEFORE the server clock query: network/commit latency
+                # shortens this permit, never extends the database lease. A slow
+                # COMMIT cannot authorize dispatch after a new owner takes over.
+                permit = _DispatchPermit(fence, clock_anchor + (turn.lease_expires_at - now).total_seconds())
                 account.reserved_tokens += extra
                 reservation.reserved_tokens += extra
                 reservation.pending_invocations += 1
@@ -193,6 +210,8 @@ class DurableQuotaUsageReporter:
                 user_id=attr.user_id, reserved_tokens=budget,
                 invocation_json=invocation.model_dump(mode="json"), status="pending",
             ))
+        if permit is not None:
+            self._dispatch_permits[invocation.operation_id] = permit
 
     async def replay_pending(self) -> dict[str, int]:
         replayed = failed = 0
@@ -215,6 +234,7 @@ class DurableQuotaUsageReporter:
         usage: CanonicalTokenUsage,
         outcome: InvocationOutcome,
     ) -> None:
+        self._dispatch_permits.pop(invocation.operation_id, None)
         # The exact fact reaches persistent storage before attempting MySQL.
         # A DB failure leaves both this fact and the pre-call intent pending.
         path = await asyncio.to_thread(self.journal.put, invocation, usage, outcome)

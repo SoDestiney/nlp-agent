@@ -442,3 +442,39 @@ async def test_local_fence_revoked_after_prepare_blocks_provider_and_closes_inte
     assert raw.calls == candidate.circuit.failures == 0
     assert reservation.pending_invocations == account.unknown_usage_events == 0
     assert next(iter(events.values())).error_kind == "provider_not_dispatched"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_commit_wait_crossing_lease_expiry_prevents_old_provider_dispatch(stream, tmp_path, monkeypatch):
+    from core.model_runtime.reporters import ModelUsageReporterSlot
+    from core.model_runtime.runtime import ResilientChatModel
+    from core.model_runtime.usage import bind_usage_attribution
+    from tests.test_model_usage_reporting import FakeRawModel, _candidate
+    import server.model_usage.quota as quota
+
+    factory, reservation, account, _, events = ledger()
+    clock = [0.0]
+    monkeypatch.setattr(quota, "time", SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
+
+    @asynccontextmanager
+    async def slow_commit():
+        async with factory.begin() as session:
+            yield session
+            # Simulate delayed commit; another generation can claim immediately
+            # after release. Heartbeat has not yet revoked this local context.
+            clock[0] += 120
+
+    reporter = DurableQuotaUsageReporter(SimpleNamespace(begin=slow_commit), journal_directory=tmp_path)
+    raw = FakeRawModel([])
+    candidate = _candidate("test", raw)
+    model = ResilientChatModel([candidate], normalize_response=False, reporter_slot=ModelUsageReporterSlot(reporter))
+    with bind_usage_attribution(invocation().attribution), pytest.raises(LostTurnClaimError):
+        if stream:
+            async for _ in model.astream("old lease"):
+                pass
+        else:
+            await model.ainvoke("old lease")
+    assert raw.calls == candidate.circuit.failures == 0
+    assert reservation.pending_invocations == account.unknown_usage_events == 0
+    assert next(iter(events.values())).error_kind == "provider_not_dispatched"

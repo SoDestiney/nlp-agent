@@ -8,7 +8,7 @@
 
 基点：`e2b2d75`。仅修复本轮 P1/P2 及同链路的未派发 Intent 计量边界，不修改部署容量，不启动 Docker/MySQL，不推送远端。
 
-- `DurableQuotaUsageReporter.prepare()` 保持 Turn → 全局容量 → Reservation → Account 锁顺序，按数据库当前时间核验 generation、owner、有效 lease、本地 fence 和 running 状态。Intent 锁等待之后再次核验租约/fence，失权不得插入 Intent 或增加 pending。实际流式/非流式 Provider 派发前再检查本地 fence，覆盖准备提交与 telemetry await 之间的本地撤销。该授权点检查不等于外部 Provider exactly-once。
+- `DurableQuotaUsageReporter.prepare()` 保持 Turn → 全局容量 → Reservation → Account 锁顺序，按数据库当前时间核验 generation、owner、有效 lease、本地 fence 和 running 状态。Intent 锁等待之后再次核验租约/fence，失权不得插入 Intent 或增加 pending。实际流式/非流式 Provider 派发前再检查本地 fence 与绑定该 fence 的保守、单次派发期限；期限以数据库剩余租约和查询前 monotonic 锚点生成，查询/COMMIT 等待不能延长授权。覆盖准备提交与 telemetry await 之间的本地撤销，以及 COMMIT 跨过租约期限而 heartbeat 尚未撤销的窗口。该授权点检查不等于外部 Provider exactly-once。
 - 已发生费用的 `report()`/journal replay 不依赖执行 fence，旧 generation 的迟到用量继续幂等入账。
 - 准备 SQL/锁等待默认独立 5 秒期限；超时事务回滚，runtime 分类为 `usage_preparation_timeout`，不经过 Provider 重试/熔断。期限在 COMMIT 前退出，避免主动取消 COMMIT 的不确定性；COMMIT 等待同样不占用 Provider 期限。
 - 流式 total/TTFT 起点移到准备成功之后。确定尚未派发的请求使用 `estimated` 零用量与 `provider_not_dispatched` 结束 Intent，不产生 unknown_usage；已开始 Provider 迭代的请求仍保守记录可能发生的费用。
@@ -17,7 +17,7 @@
 
 本轮已执行：
 
-- 受影响后端集合重新运行：**181 passed / 6 warnings**。其中 quota reporting **32 项**，覆盖 generation/owner/lease/missing/revoked/wrong-turn、锁等待期间失权、流式/非流式零派发、迟到入账、独立准备超时及不误触 Provider 熔断。没有复用前轮 161 的数字。
+- 最终代码受影响后端集合重新运行：**183 passed / 6 warnings**。其中 quota reporting **34 项**，覆盖 generation/owner/lease/missing/revoked/wrong-turn、锁等待期间失权、COMMIT 跨租约、流式/非流式零派发、迟到入账、独立准备超时及不误触 Provider 熔断。COMMIT 跨租约的两项用例也先失败再修复，没有复用前轮 161 的数字。
 - Ruff、修改文件 compileall、diff whitespace 检查：通过。
 - 真实 MySQL 回归文件：**4 tests collected，未执行**。新增真实行锁/generation 接管后旧 Worker 流式/非流式零派发、旧已发生费用仍可上报；既有取消/迟到/提交失败重放用例补齐真实执行所有权。
 - 项目默认全量后端 `pytest -q --tb=line` 正在运行；结果在本节后补充。`RUN_API_HTTP=0`，真实 HTTP 套件按其现有 opt-in 规则不启动，不把 skip 当验证通过。
