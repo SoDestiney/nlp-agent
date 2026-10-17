@@ -125,7 +125,7 @@ async def consume_code(
     )
     if row is None:
         return False
-    valid = row.expires_at >= _utc_now() and secrets.compare_digest(row.code_hash, _code_hash(code))
+    valid = row.expires_at > _utc_now() and secrets.compare_digest(row.code_hash, _code_hash(code))
     if kind == "sms":
         row.kind = "sms_history"
         row.expires_at = _utc_now()

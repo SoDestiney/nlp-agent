@@ -218,18 +218,6 @@ def test_database_authenticated_upload_uses_database_session_dependencies(
         principal_for_user_id,
     )
 
-    class NoopQuota:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        async def reserve(self, *_args, **_kwargs):
-            return object()
-
-        async def finalize(self, *_args, **_kwargs):
-            return None
-
-    monkeypatch.setattr(uploads_controller, "AsyncStorageQuota", NoopQuota)
-
     client = TestClient(app)
     client.cookies.set("nlp_session", "database-token")
     response = client.post(

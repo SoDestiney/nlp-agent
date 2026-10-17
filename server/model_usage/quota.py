@@ -121,6 +121,11 @@ class DurableQuotaUsageReporter:
         if reserve is not None:
             await reserve(invocation)
 
+    def set_snapshot_notifier(self, notifier: Any | None) -> None:
+        setter = getattr(self._downstream_reporter, "set_snapshot_notifier", None)
+        if setter is not None:
+            setter(notifier)
+
     def close(self) -> None:
         close = getattr(self._downstream_reporter, "close", None)
         if close is not None:

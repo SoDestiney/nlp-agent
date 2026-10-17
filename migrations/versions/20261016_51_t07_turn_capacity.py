@@ -23,7 +23,7 @@ def upgrade() -> None:
         sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("(UTC_TIMESTAMP(6))")),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
-        comment="Authoritative queue and execution capacity for durable Turns.",
+        comment="持久化课堂 Turn 队列与运行容量计数及全局限额。",
     )
     op.create_table(
         "nlp_turn_user_capacity",
@@ -32,7 +32,7 @@ def upgrade() -> None:
         sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("(UTC_TIMESTAMP(6))")),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
-        comment="Per-user accepted plus running Turn capacity counters.",
+        comment="持久化用户待处理与运行中 Turn 的并发计数。",
     )
     op.execute(
         sa.text(

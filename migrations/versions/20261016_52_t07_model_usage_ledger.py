@@ -23,7 +23,7 @@ def upgrade() -> None:
         sa.Column("updated_at", mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("(UTC_TIMESTAMP(6))")),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
-        comment="Token quota account; NULL quota_tokens means unlimited production admission.",
+        comment="用户模型 Token 额度账户及累计预留、消耗和未知用量。",
     )
     op.create_table(
         "nlp_model_quota_reservations",
@@ -43,7 +43,7 @@ def upgrade() -> None:
         sa.Index("ix_nlp_model_quota_reservations_status_turn", "status", "turn_id"),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
-        comment="One token reservation per durable classroom Turn.",
+        comment="Turn 提交时创建并在终态结算的模型 Token 预留。",
     )
     op.create_table(
         "nlp_model_usage_events",
@@ -85,7 +85,7 @@ def upgrade() -> None:
         sa.Index("ix_nlp_model_usage_events_turn", "turn_id", "completed_at"),
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
-        comment="Immutable Provider-attempt usage facts, deduplicated by operation_id.",
+        comment="按 Provider Attempt 幂等保存的模型用量事实。",
     )
     op.add_column(
         "nlp_turns",

@@ -30,6 +30,22 @@ def outcome():
     return InvocationOutcome(status="succeeded", completed_at=datetime.now(timezone.utc))
 
 
+def test_credit_snapshot_notifier_survives_token_reporter_wrapping(tmp_path):
+    class Credits:
+        notifier = None
+
+        def set_snapshot_notifier(self, notifier):
+            self.notifier = notifier
+
+    credits = Credits()
+    reporter = DurableQuotaUsageReporter(None, journal_directory=tmp_path, downstream_reporter=credits)
+    notifier = object()
+    reporter.set_snapshot_notifier(notifier)
+    assert credits.notifier is notifier
+    reporter.set_snapshot_notifier(None)
+    assert credits.notifier is None
+
+
 @pytest.mark.asyncio
 async def test_develop_credit_reporter_keeps_its_reservation_identity(tmp_path):
     factory, reservation, account, _, _ = ledger()
