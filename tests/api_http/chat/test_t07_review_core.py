@@ -57,7 +57,7 @@ def test_mysql_rejects_old_worker_writes_and_http_replays_handover(
 
 
 def test_sms_resend_accepts_new_code_and_preserves_history_over_http(http_client, mysql_probe):
-    phone = f"139{uuid.uuid4().int % 10**8:08d}"
+    phone = f"+86139{uuid.uuid4().int % 10**8:08d}"
     for index, code in enumerate(("111111", "222222")):
         captcha_id = _captcha(http_client, mysql_probe)
         sent = http_client.post("/api/v1/auth/sms/send", json={"phone_number": phone, "captcha_id": captcha_id, "captcha_code": CAPTCHA_CODE})

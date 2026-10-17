@@ -112,6 +112,8 @@ def test_chat_turn_idempotency_is_replayable_but_conflicts_on_changed_input(
         "session_id": session["session_id"],
         "status": "completed",
         "duplicate": True,
+        "queue_position": None,
+        "waited_s": None,
     }
 
     conflict = authenticated_client.post(

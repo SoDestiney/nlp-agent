@@ -447,6 +447,20 @@ class MySQLGatewayRepository:
                 c.execute(text("INSERT INTO nlp_outbox_messages(id,topic,payload_json,status) VALUES(UUID(),'turn.dispatch',:payload,'pending')"), {"payload": json.dumps({"turn_id": turn_id, "task": dispatch_payload})})
             if storage is not None:
                 storage.finalize(storage_reservation, reconcile=True)
+            if terminal and not preserve_terminal:
+                if status == TurnStatus.COMPLETED:
+                    self.ensure_event(turn_id=turn_id, session_id="", event_type=GatewayEventType.MESSAGE_COMPLETED,
+                        payload={"content": final_text or ""}, expected_claim_generation=expected_claim_generation, _connection=c)
+                    event_type = GatewayEventType.TURN_COMPLETED
+                    event_payload = {"status": status.value, "content": final_text or ""}
+                elif status == TurnStatus.CANCELLED:
+                    event_type = GatewayEventType.TURN_CANCELLED
+                    event_payload = {"status": status.value}
+                else:
+                    event_type = GatewayEventType.TURN_FAILED
+                    event_payload = {"status": status.value, "error_kind": error_kind or "turn_failed", "message": stored_error or ""}
+                self.ensure_event(turn_id=turn_id, session_id="", event_type=event_type,
+                    payload=event_payload, expected_claim_generation=expected_claim_generation, _connection=c)
         row = self._row(turn_id)
         if row is None:
             raise KeyError(turn_id)

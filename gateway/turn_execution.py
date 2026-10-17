@@ -46,6 +46,8 @@ def _error_kind_for_turn(error: BaseException) -> str:
     )
     if isinstance(error, AdmissionLimitError):
         return error.code
+    if isinstance(error, TimeoutError) and not isinstance(error, TurnExecutionTimeoutError):
+        return classify_model_error(error).kind
     if isinstance(error, StreamInterruptedError):
         return "stream_interrupted"
     if isinstance(error, ModelRuntimeExhaustedError) and error.__cause__ is not None:

@@ -30,6 +30,7 @@ from server.auth.verification_policy import EMAIL_CODE_TTL_S, EMAIL_RESEND_COOLD
 # ---------------------------------------------------------------------------
 
 CAPTCHA_TTL_S = 120           # 图形验证码 2 分钟内有效
+SMS_CODE_TTL_S = 300          # 手机验证码 5 分钟内有效
 EMAIL_MAX_PER_EMAIL_HOUR = 10 # 同一邮箱每小时最多 10 封
 EMAIL_MAX_PER_IP_HOUR = 30    # 同一 IP 每小时最多 30 封
 
