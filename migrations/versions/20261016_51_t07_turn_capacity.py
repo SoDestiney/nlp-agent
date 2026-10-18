@@ -1,6 +1,6 @@
 """Maintain authoritative MySQL counts for active classroom Turns."""
 
-from alembic import op
+from alembic import context, op
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 
@@ -9,6 +9,17 @@ revision = "20261016_51_t07"
 down_revision = "20261016_51_t06_phone_identity"
 branch_labels = None
 depends_on = None
+
+
+def _create_trigger(name: str, sql: str) -> None:
+    if not context.is_offline_mode():
+        existing = op.get_bind().execute(sa.text(
+            "SELECT 1 FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME=:name"
+        ), {"name": name}).first()
+        if existing is not None:
+            return
+    op.execute(sql)
 
 
 def upgrade() -> None:
@@ -24,6 +35,7 @@ def upgrade() -> None:
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
         comment="持久化课堂 Turn 队列与运行容量计数及全局限额。",
+        if_not_exists=True,
     )
     op.create_table(
         "nlp_turn_user_capacity",
@@ -33,6 +45,7 @@ def upgrade() -> None:
         mysql_engine="InnoDB",
         mysql_charset="utf8mb4",
         comment="持久化用户待处理与运行中 Turn 的并发计数。",
+        if_not_exists=True,
     )
     op.execute(
         sa.text(
@@ -42,6 +55,8 @@ def upgrade() -> None:
             "COALESCE(SUM(status='accepted'),0), "
             "COALESCE(SUM(status='running'),0), UTC_TIMESTAMP(6) "
             "FROM nlp_turns"
+            " ON DUPLICATE KEY UPDATE queued_count=VALUES(queued_count), "
+            "running_count=VALUES(running_count),last_reconciled_at=VALUES(last_reconciled_at)"
         )
     )
     op.execute(
@@ -49,10 +64,11 @@ def upgrade() -> None:
             "INSERT INTO nlp_turn_user_capacity(user_id,active_count) "
             "SELECT user_id,COUNT(*) FROM nlp_turns "
             "WHERE status IN ('accepted','running') GROUP BY user_id"
+            " ON DUPLICATE KEY UPDATE active_count=VALUES(active_count)"
         )
     )
 
-    op.execute(
+    _create_trigger("trg_nlp_turns_capacity_ai",
         """
         CREATE TRIGGER trg_nlp_turns_capacity_ai AFTER INSERT ON nlp_turns
         FOR EACH ROW
@@ -87,7 +103,7 @@ def upgrade() -> None:
         END
         """
     )
-    op.execute(
+    _create_trigger("trg_nlp_turns_capacity_au",
         """
         CREATE TRIGGER trg_nlp_turns_capacity_au AFTER UPDATE ON nlp_turns
         FOR EACH ROW
@@ -174,7 +190,7 @@ def upgrade() -> None:
         END
         """
     )
-    op.execute(
+    _create_trigger("trg_nlp_turns_capacity_ad",
         """
         CREATE TRIGGER trg_nlp_turns_capacity_ad AFTER DELETE ON nlp_turns
         FOR EACH ROW

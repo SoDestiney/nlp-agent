@@ -38,10 +38,27 @@ def protected(project, read=inspect):
     return result
 
 
+def prepare_trigger_migrations(project, execute=run):
+    # The password stays inside the existing MySQL container, never in argv
+    # or captured output. Only the explicitly requested test environment is
+    # configured automatically; production must be provisioned by its DBA.
+    sql = "SELECT IF(@@GLOBAL.log_bin=0 OR @@GLOBAL.log_bin_trust_function_creators=1,1,0)"
+    if project == "nova-test":
+        sql = "SET GLOBAL log_bin_trust_function_creators=1; " + sql
+    output = execute([
+        "docker", "exec", project + "-mysql-1", "sh", "-ec",
+        'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"; exec mysql --user=root '
+        '--batch --skip-column-names --execute="' + sql + '"',
+    ])
+    require(output is not None and output.strip() in (b"1", "1"),
+            "MYSQL_TRIGGER_MIGRATION_PRIVILEGES_REQUIRED")
+
+
 def update(compose, project, *, execute=run, read=inspect, sleep=time.sleep, clock=time.monotonic,
-           allowed_projects=("nova-test", "nova-prod")):
+           allowed_projects=("nova-test", "nova-prod"), prepare=prepare_trigger_migrations):
     require(project in allowed_projects, "PROJECT_OUT_OF_SCOPE")
     original = protected(project, read)
+    prepare(project, execute)
     # Explicitly exclude dependencies; an application release must not upgrade
     # the live database or Redis image/configuration as a side effect.
     execute([*compose, "up", "-d", "--no-deps", "--force-recreate", "--no-build", "nova-migrate"])
