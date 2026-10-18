@@ -27,9 +27,47 @@ def services():
     return result
 
 
+def test_test_mysql_trigger_preflight_precedes_all_migration_commands(updater):
+    values, commands = services(), []
+
+    def execute(command):
+        commands.append(command)
+        return b"1\n"
+
+    updater.update(["compose"], "nova-test", execute=execute, read=values.__getitem__)
+    assert commands[0][:3] == ["docker", "exec", "nova-test-mysql-1"]
+    assert "SET GLOBAL log_bin_trust_function_creators" in commands[0][-1]
+    assert commands[1][-1] == "nova-migrate"
+
+
+def test_trigger_preflight_failure_does_not_start_migration(updater):
+    values, commands = services(), []
+
+    def execute(command):
+        commands.append(command)
+        return b"0\n"
+
+    with pytest.raises(ValueError, match="MYSQL_TRIGGER_MIGRATION_PRIVILEGES_REQUIRED"):
+        updater.update(["compose"], "nova-test", execute=execute, read=values.__getitem__)
+    assert len(commands) == 1
+
+
+def test_production_trigger_preflight_is_read_only(updater):
+    commands = []
+
+    def execute(command):
+        commands.append(command)
+        return b"0\n"
+
+    with pytest.raises(ValueError, match="MYSQL_TRIGGER_MIGRATION_PRIVILEGES_REQUIRED"):
+        updater.prepare_trigger_migrations("nova-prod", execute)
+    assert "SELECT IF" in commands[0][-1]
+    assert "SET GLOBAL" not in commands[0][-1]
+
+
 def test_bootstrap_is_completed_before_application_recreation(updater):
     values, commands = services(), []
-    updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__)
+    updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__, prepare=lambda *_: None)
     assert len(commands) == 2 and commands[0][-1] == "nova-migrate"
     assert commands[1][-5:] == list(updater.APPLICATIONS)
     assert all("--no-deps" in command for command in commands)
@@ -41,7 +79,7 @@ def test_failed_migration_keeps_existing_applications_running(updater):
     values, commands = services(), []
     values["nova-test-nova-migrate-1"]["State"]["ExitCode"] = 7
     with pytest.raises(ValueError, match="MIGRATION_FAILED_APPLICATIONS_UNCHANGED"):
-        updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__)
+        updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__, prepare=lambda *_: None)
     assert len(commands) == 1 and commands[0][-1] == "nova-migrate"
 
 
@@ -50,7 +88,7 @@ def test_slow_migration_never_starts_new_applications(updater):
     values["nova-test-nova-migrate-1"]["State"]["Running"] = True
     times = iter((0, 181))
     with pytest.raises(ValueError, match="MIGRATION_TIMEOUT_APPLICATIONS_UNCHANGED"):
-        updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__, clock=lambda: next(times))
+        updater.update(["compose"], "nova-test", execute=commands.append, read=values.__getitem__, clock=lambda: next(times), prepare=lambda *_: None)
     assert len(commands) == 1
 
 
@@ -60,7 +98,7 @@ def test_database_replacement_during_bootstrap_stops_application_recreation(upda
         commands.append(command)
         values["nova-test-mysql-1"]["Id"] = "replaced"
     with pytest.raises(ValueError, match="DATABASE_SERVICE_CHANGED_DURING_BOOTSTRAP"):
-        updater.update(["compose"], "nova-test", execute=execute, read=values.__getitem__)
+        updater.update(["compose"], "nova-test", execute=execute, read=values.__getitem__, prepare=lambda *_: None)
     assert len(commands) == 1
 
 
