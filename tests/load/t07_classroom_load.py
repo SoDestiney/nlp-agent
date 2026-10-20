@@ -210,8 +210,9 @@ async def _login_user(
     index: int,
     ramp_seconds: float,
     start_at: float,
+    total_users: int = 50,
 ) -> dict[str, Any]:
-    await asyncio.sleep(max(0.0, start_at + ramp_seconds * index / max(1, 50) - time.monotonic()))
+    await asyncio.sleep(max(0.0, start_at + ramp_seconds * index / max(1, total_users) - time.monotonic()))
     client = httpx.AsyncClient(base_url=base_url, timeout=20, follow_redirects=False)
     started = time.monotonic()
     try:
@@ -259,6 +260,7 @@ async def _login_user(
             "session_ms": round(session_ms, 3),
             "conversation_status": 201,
             "conversation_ms": round((time.monotonic() - create_started) * 1000, 3),
+            "last_http_completed_at": time.monotonic(),
             "client": client,
         }
     except Exception:
@@ -271,27 +273,60 @@ async def _open_websocket(user: dict[str, Any], *, base_url: str, origin: str) -
     if client is None:
         return None, {"username": user["username"], "status": "not_connected", "reason": "login_failed"}
     started = time.monotonic()
-    ticket = await client.post("/api/v1/auth/ws-ticket", headers={"Origin": origin, "X-CSRF-Token": user["csrf"]})
-    if ticket.status_code != 200:
-        return None, {"username": user["username"], "status": ticket.status_code, "code": _problem_code(ticket)}
-    cookie = client.cookies.get("nlp_session")
-    if not cookie:
-        return None, {"username": user["username"], "status": "missing_cookie"}
-    scheme = "wss" if base_url.startswith("https://") else "ws"
-    ws_url = f"{scheme}://{urlsplit(base_url).netloc}/ws/v1?ticket={ticket.json()['ticket']}"
-    websocket = await connect(
-        ws_url,
-        origin=origin,
-        additional_headers={"Cookie": f"nlp_session={cookie}"},
-        proxy=None,
-        open_timeout=10,
-        close_timeout=5,
-    )
-    ready = json.loads(await asyncio.wait_for(websocket.recv(), timeout=10))
-    if ready.get("type") != "connection.ready":
-        await websocket.close()
-        return None, {"username": user["username"], "status": "not_ready", "frame_type": ready.get("type")}
-    return websocket, {"username": user["username"], "status": "ready", "latency_ms": round((time.monotonic() - started) * 1000, 3)}
+    stage, websocket, handed_off = "ticket_request", None, False
+    metrics = {"username": user["username"]}
+    ticket_trace = []
+
+    async def observe_ticket(event, details):
+        # Fixed httpcore event names only; never retain URLs, headers or details.
+        if event in {"connection.connect_tcp.started", "connection.connect_tcp.complete",
+                     "connection.start_tls.started", "connection.start_tls.complete",
+                     "http11.send_request_headers.started", "http11.send_request_headers.complete",
+                     "http11.receive_response_headers.started", "http11.receive_response_headers.complete",
+                     "http11.receive_response_headers.failed"} and len(ticket_trace) < 20:
+            ticket_trace.append(event)
+
+    try:
+        ticket = await client.post("/api/v1/auth/ws-ticket", headers={"Origin": origin, "X-CSRF-Token": user["csrf"]},
+                                   extensions={"trace": observe_ticket})
+        stage = "ticket_response"
+        if ticket.status_code != 200:
+            metrics.update(status=ticket.status_code, stage=stage, code=_problem_code(ticket))
+            return None, metrics
+        cookie = client.cookies.get("nlp_session")
+        if not cookie:
+            metrics.update(status="missing_cookie", stage=stage)
+            return None, metrics
+        scheme = "wss" if base_url.startswith("https://") else "ws"
+        ws_url = f"{scheme}://{urlsplit(base_url).netloc}/ws/v1?ticket={ticket.json()['ticket']}"
+        stage = "websocket_upgrade"
+        websocket = await connect(
+            ws_url, origin=origin, additional_headers={"Cookie": f"nlp_session={cookie}"},
+            proxy=None, open_timeout=10, close_timeout=5,
+        )
+        stage = "connection_ready"
+        ready = json.loads(await asyncio.wait_for(websocket.recv(), timeout=10))
+        if ready.get("type") != "connection.ready":
+            metrics.update(status="not_ready", stage=stage, frame_type=ready.get("type"))
+            return None, metrics
+        handed_off = True
+        metrics.update(status="ready", latency_ms=round((time.monotonic() - started) * 1000, 3))
+        return websocket, metrics
+    except Exception as error:
+        # A ticket HTTP transport failure is not an upgraded WebSocket failure.
+        # Keep the failure, classify its stage, and do not retry or log secrets.
+        metrics.update(status="error", stage=stage, error=type(error).__name__)
+        if stage == "ticket_request":
+            metrics.update(ticket_trace=ticket_trace,
+                           ticket_connection_reused=bool(ticket_trace) and "connection.connect_tcp.started" not in ticket_trace,
+                           idle_before_ticket_ms=round((started - user.get("last_http_completed_at", started)) * 1000, 3))
+        return None, metrics
+    finally:
+        if websocket is not None and not handed_off:
+            try:
+                await websocket.close()
+            except Exception:
+                metrics["cleanup_failed"] = True
 
 
 async def _submit_and_wait(
@@ -303,6 +338,7 @@ async def _submit_and_wait(
     index: int,
     total: int,
     start_at: float,
+    model_profile: str | None = None,
 ) -> dict[str, Any]:
     client: httpx.AsyncClient = user["client"]
     await asyncio.sleep(max(0.0, start_at + ramp_seconds * index / max(1, total) - time.monotonic()))
@@ -315,6 +351,7 @@ async def _submit_and_wait(
             "session_id": user["session_id"],
             "content": f"T07 load test {run_id} user {user['index']}",
             "idempotency_key": f"t07-{run_id}-{user['index']}",
+            **({"model_profile": model_profile} if model_profile else {}),
         },
     )
     accepted_ms = round((time.monotonic() - started) * 1000, 3)
@@ -375,6 +412,10 @@ async def _submit_and_wait(
                 first_token_at = datetime.fromisoformat(
                     str(first_token["created_at"]).replace("Z", "+00:00")
                 )
+                # Persistence timestamps are UTC; MySQL may serialize them
+                # without an offset. Preserve explicit offsets when present.
+                if first_token_at.tzinfo is None:
+                    first_token_at = first_token_at.replace(tzinfo=timezone.utc)
                 result["first_token_ms"] = round(
                     (first_token_at - started_wall).total_seconds() * 1000, 3
                 )
@@ -413,6 +454,19 @@ async def collect_terminal_events(client: httpx.AsyncClient, turn_id: str, *, ti
         await asyncio.sleep(0.1)
 
 
+def validate_workload_size(profile, args, base_url):
+    size = int(profile.get("user_count", 0)), int(profile.get("turn_count", 0))
+    comparison = getattr(args, "isolated_three_class_comparison", False)
+    if size == (50, 30) and not comparison:
+        return
+    target = urlsplit(base_url)
+    if (size == (120, 30) and comparison and profile.get("classroom_count") == 3
+            and getattr(args, "run_kind", "regression") == "regression"
+            and target.scheme == "http" and target.hostname == "127.0.0.1"):
+        return
+    raise LoadTestError("release profile requires 50 users/30 Turns; three-class comparison requires explicit isolated loopback mode")
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     base_url = validate_base_url(args.base_url)
     output = validate_output_path(args.output)
@@ -435,8 +489,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "profile requests scenarios not implemented by this runner: "
             + ", ".join(missing)
         )
-    if int(profile.get("user_count", 0)) != 50 or int(profile.get("turn_count", 0)) != 30:
-        raise LoadTestError("the release load profile must use 50 users and 30 Turns")
+    validate_workload_size(profile, args, base_url)
     users = _profile_users(profile)
     if len(users) < int(profile.get("turn_count", 0)):
         raise LoadTestError("turn_count cannot exceed the number of provisioned users")
@@ -458,7 +511,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         login_started_at = datetime.now(timezone.utc).isoformat()
         ramp = float(profile.get("login_ramp_seconds", 10))
         user_results = await asyncio.gather(*(
-            _login_user(base_url, origin, user, index, ramp, login_started)
+            _login_user(base_url, origin, user, index, ramp, login_started, len(users))
             for index, user in enumerate(users)
         ))
         phases["auth_burst"] = {
@@ -580,6 +633,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                             test_user, run_id=f"{run_id}-provider-{mode}",
                             timeout_s=max(timeout_s, 90), ramp_seconds=0,
                             index=0, total=1, start_at=time.monotonic(),
+                            model_profile="qwen" if mode == "timeout" else None,
                         )
                         session_response = await test_user["client"].get(
                             "/api/v1/auth/session", headers={"Origin": origin}
@@ -625,7 +679,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "target": {"origin": origin, "deployment_environment": health.get("deployment_environment"), "baseline_product_commit": health.get("baseline_product_commit")},
             "machine": {"platform": platform.platform(), "processor": platform.processor(), "python": sys.version.split()[0]},
             "source": {"git_commit": subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False).stdout.strip()},
-            "deployment_profile": {key: profile.get(key) for key in ("worker_replicas", "worker_concurrency", "database_pool_size", "database_max_overflow", "database_sync_pool_size", "database_sync_max_overflow", "worker_database_pool_size", "worker_database_max_overflow", "worker_async_engine_count", "worker_sync_pool_size", "worker_sync_max_overflow", "database_pool_timeout_seconds", "expected_fake_model_delay_seconds")},
+            "deployment_profile": {key: profile.get(key) for key in ("user_count", "classroom_count", "turn_count", "worker_replicas", "worker_concurrency", "database_pool_size", "database_max_overflow", "database_sync_pool_size", "database_sync_max_overflow", "worker_database_pool_size", "worker_database_max_overflow", "worker_async_engine_count", "worker_sync_pool_size", "worker_sync_max_overflow", "database_pool_timeout_seconds", "expected_fake_model_delay_seconds")},
             "scenario_coverage": requested_scenarios,
             "fake_provider": {"calls_before": fake_before.get("calls_total"), "calls_after": fake_after.get("calls_total"), "configured_delay_seconds": profile.get("expected_fake_model_delay_seconds")},
             "phases": phases,
@@ -649,6 +703,7 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-kind", choices=("baseline", "regression"), default="regression")
     parser.add_argument("--baseline-ref", help="exact old-version commit, required for baseline runs")
+    parser.add_argument("--isolated-three-class-comparison", action="store_true", help="bounded 120-user comparison on disposable loopback services only")
     args = parser.parse_args()
     try:
         report = asyncio.run(run(args))
