@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import math
 import secrets
 import uuid
 from collections import defaultdict, deque
@@ -33,8 +34,15 @@ from server.infrastructure.mysql.models import (
     WsTicketModel,
 )
 from server.user.service import PasswordHasherSingleton
+from server.user.phone import normalize_phone_number
 from server.sandbox.service import sandbox_lifecycle_service
-from server.web.auth import AuthenticationError, CsrfRejectedError, OriginRejectedError
+from server.web.auth import (
+    AuthenticationError,
+    AuthorizationChangedError,
+    CsrfRejectedError,
+    LoginRateLimitError,
+    OriginRejectedError,
+)
 
 
 def _utc_now() -> datetime:
@@ -72,17 +80,55 @@ class _RateLimiter:
         self._failures: dict[str, deque[float]] = defaultdict(deque)
 
     def allowed(self, key: str) -> bool:
+        return self.retry_after(key) == 0
+
+    def retry_after(self, key: str) -> int:
         now = monotonic()
         failures = self._failures[key]
         while failures and now - failures[0] >= self.window_s:
             failures.popleft()
-        return len(failures) < self.max_attempts
+        if len(failures) < self.max_attempts:
+            return 0
+        # Concurrent attempts can overshoot the threshold. Wait until enough
+        # failures, rather than just the oldest one, leave the sliding window.
+        blocked_until = failures[len(failures) - self.max_attempts] + self.window_s
+        return max(1, math.ceil(blocked_until - now))
 
     def record_failure(self, key: str) -> None:
         self._failures[key].append(monotonic())
 
     def clear(self, key: str) -> None:
         self._failures.pop(key, None)
+
+
+# Keep increments and TTL assignment atomic. An interrupted process must not
+# leave a permanent lockout counter behind. Status also repairs old counters
+# that lack a TTL, without extending the window on every blocked request.
+_LOGIN_RATE_STATUS = """
+local retry = 0
+for i = 1, 2 do
+    local count = tonumber(redis.call('GET', KEYS[i]) or '0')
+    if count >= tonumber(ARGV[i]) then
+        local ttl = redis.call('TTL', KEYS[i])
+        if ttl < 0 then
+            ttl = tonumber(ARGV[i + 2])
+            redis.call('EXPIRE', KEYS[i], ttl)
+        end
+        retry = math.max(retry, math.max(1, ttl))
+    end
+end
+return retry
+"""
+
+_LOGIN_RATE_FAILURE = """
+for i = 1, 2 do
+    local count = redis.call('INCR', KEYS[i])
+    if count == 1 or redis.call('TTL', KEYS[i]) < 0 then
+        redis.call('EXPIRE', KEYS[i], tonumber(ARGV[i]))
+    end
+end
+return 1
+"""
 
 
 class DatabaseSessionAuth:
@@ -98,6 +144,8 @@ class DatabaseSessionAuth:
         idle_timeout_s: int = 900,
         max_login_attempts: int = 5,
         rate_window_s: int = 300,
+        max_ip_login_attempts: int = 100,
+        ip_rate_window_s: int | None = None,
     ) -> None:
         self.cookie_name = cookie_name
         self.ttl_s = min(max(int(ttl_s), 300), 604_800)
@@ -107,8 +155,14 @@ class DatabaseSessionAuth:
             item.rstrip("/").lower() for item in (allowed_origins or []) if item
         }
         self._hasher = PasswordHasherSingleton.get()
+        # Password hashing uses substantial CPU/memory. Keep those jobs outside
+        # DB transactions and bound them independently of database connections.
+        self._password_verifications = asyncio.Semaphore(2)
         self._username_rate_limiter = _RateLimiter(max_login_attempts, rate_window_s)
-        self._client_rate_limiter = _RateLimiter(max_login_attempts, rate_window_s)
+        self._client_rate_limiter = _RateLimiter(
+            max_ip_login_attempts,
+            rate_window_s if ip_rate_window_s is None else ip_rate_window_s,
+        )
         self._redis = None
         self._rate_prefix = "nlp-agent:auth-login:"
 
@@ -117,30 +171,41 @@ class DatabaseSessionAuth:
         self._redis = redis_client
 
     async def _rate_allowed(self, username: str, client_key: str) -> bool:
+        return await self._rate_retry_after(username, client_key) == 0
+
+    def _rate_keys(self, username: str, client_key: str) -> tuple[str, str]:
+        return f"{self._rate_prefix}user:{username}", f"{self._rate_prefix}ip:{client_key}"
+
+    async def _rate_retry_after(self, username: str, client_key: str) -> int:
         if self._redis is None:
-            return self._username_rate_limiter.allowed(username) and self._client_rate_limiter.allowed(client_key)
-        for key in (f"{self._rate_prefix}user:{username}", f"{self._rate_prefix}ip:{client_key}"):
-            value = await self._redis.get(key)
-            if value is not None and int(value) >= self._username_rate_limiter.max_attempts:
-                return False
-        return True
+            return max(self._username_rate_limiter.retry_after(username),
+                       self._client_rate_limiter.retry_after(client_key))
+        return int(await self._redis.eval(
+            _LOGIN_RATE_STATUS, 2, *self._rate_keys(username, client_key),
+            self._username_rate_limiter.max_attempts,
+            self._client_rate_limiter.max_attempts,
+            self._username_rate_limiter.window_s,
+            self._client_rate_limiter.window_s,
+        ))
 
     async def _rate_failure(self, username: str, client_key: str) -> None:
         if self._redis is None:
             self._username_rate_limiter.record_failure(username)
             self._client_rate_limiter.record_failure(client_key)
             return
-        for key in (f"{self._rate_prefix}user:{username}", f"{self._rate_prefix}ip:{client_key}"):
-            count = await self._redis.incr(key)
-            if int(count) == 1:
-                await self._redis.expire(key, self._username_rate_limiter.window_s)
+        await self._redis.eval(
+            _LOGIN_RATE_FAILURE, 2, *self._rate_keys(username, client_key),
+            self._username_rate_limiter.window_s,
+            self._client_rate_limiter.window_s,
+        )
 
     async def _rate_clear(self, username: str, client_key: str) -> None:
         if self._redis is None:
             self._username_rate_limiter.clear(username)
-            self._client_rate_limiter.clear(client_key)
             return
-        await self._redis.delete(f"{self._rate_prefix}user:{username}", f"{self._rate_prefix}ip:{client_key}")
+        # One valid account must not reset failures belonging to every other
+        # account on a shared IP (or allow an attacker to reset the IP budget).
+        await self._redis.delete(self._rate_keys(username, client_key)[0])
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "DatabaseSessionAuth":
@@ -154,6 +219,11 @@ class DatabaseSessionAuth:
             idle_timeout_s=auth_env_int("NLP_AGENT_AUTH_IDLE_TIMEOUT_S", 900),
             max_login_attempts=auth_env_int("NLP_AGENT_AUTH_MAX_LOGIN_ATTEMPTS", 5),
             rate_window_s=auth_env_int("NLP_AGENT_AUTH_RATE_WINDOW_S", 300),
+            max_ip_login_attempts=auth_env_int("NLP_AGENT_AUTH_MAX_IP_LOGIN_ATTEMPTS", 100),
+            ip_rate_window_s=auth_env_int(
+                "NLP_AGENT_AUTH_IP_RATE_WINDOW_S",
+                auth_env_int("NLP_AGENT_AUTH_RATE_WINDOW_S", 300),
+            ),
         )
 
     @staticmethod
@@ -191,6 +261,26 @@ class DatabaseSessionAuth:
         except (VerifyMismatchError, VerificationError, ValueError, TypeError):
             return False
 
+    async def _verify_login_password(self, password_hash: str, password: str) -> bool:
+        await self._password_verifications.acquire()
+        try:
+            task = asyncio.create_task(asyncio.to_thread(
+                self._verify_password, password_hash, password, self._hasher
+            ))
+        except BaseException:
+            self._password_verifications.release()
+            raise
+
+        def finished(result: asyncio.Task[bool]) -> None:
+            # Cancelling an HTTP request cannot cancel a running hash thread.
+            # Hold its slot until the actual job finishes, including on errors.
+            self._password_verifications.release()
+            if not result.cancelled():
+                result.exception()
+
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
     async def login(
         self,
         factory: async_sessionmaker[AsyncSession],
@@ -202,19 +292,41 @@ class DatabaseSessionAuth:
         workspace_id: str | None = None,
     ) -> tuple[str, DatabaseSessionClaims]:
         normalized = username.casefold()
-        if not await self._rate_allowed(normalized, client_key):
-            raise AuthenticationError("too many login attempts")
+        retry_after_s = await self._rate_retry_after(normalized, client_key)
+        if retry_after_s:
+            raise LoginRateLimitError(retry_after_s)
+
+        # Login accepts usernames, normalized email, and canonical phone
+        # identity; manually provisioned accounts keep username login.
+        identity_criteria = (
+            (UserModel.username_lower == normalized)
+            | (UserModel.email_normalized == normalized)
+        )
+        try:
+            phone_identity = normalize_phone_number(username)
+        except ValueError:
+            phone_identity = None
+        if phone_identity is not None:
+            identity_criteria = identity_criteria | (
+                UserModel.phone_number_normalized == phone_identity
+            )
+        async with factory.begin() as session:
+            candidate = await session.scalar(
+                select(UserModel).where(identity_criteria, UserModel.deleted_at.is_(None))
+            )
+            snapshot = ((candidate.id, candidate.password_hash)
+                        if candidate is not None and candidate.status == "active" else None)
+
+        # No DB connection or row lock is held while hashing or waiting for CPU.
+        if snapshot is None or not await self._verify_login_password(snapshot[1], password):
+            await self._rate_failure(normalized, client_key)
+            raise AuthenticationError("invalid credentials")
 
         async with factory.begin() as session:
-            # 主登录入口同时接受用户名与规范化邮箱。邮箱命中唯一的
-            # ``email_normalized`` 索引；预置/后台账号仍可用用户名登录。
-            identity_criteria = (
-                (UserModel.username_lower == normalized)
-                | (UserModel.email_normalized == normalized)
-            )
             user = await session.scalar(
                 select(UserModel)
                 .where(
+                    UserModel.id == snapshot[0],
                     identity_criteria,
                     UserModel.deleted_at.is_(None),
                 )
@@ -223,9 +335,7 @@ class DatabaseSessionAuth:
             valid = (
                 user is not None
                 and user.status == "active"
-                and await asyncio.to_thread(
-                    self._verify_password, user.password_hash, password, self._hasher
-                )
+                and hmac.compare_digest(user.password_hash, snapshot[1])
             )
             if not valid:
                 await self._rate_failure(normalized, client_key)
@@ -292,45 +402,66 @@ class DatabaseSessionAuth:
         if not token:
             raise AuthenticationError("authentication cookie is missing")
         digest = self.token_hash(token)
-        failure: str | None = None
-        claims: DatabaseSessionClaims | None = None
         async with factory.begin() as session:
-            row = await self._active_row(session, digest)
-            if row is None:
-                raise AuthenticationError("authentication cookie is invalid")
-            now = _utc_now()
-            if row.last_seen_at is not None and (
-                now - row.last_seen_at
-            ).total_seconds() > self.idle_timeout_s:
-                row.revoked_at = now
-                failure = "authentication cookie has expired"
-            elif (
-                row.authorization_version != row.user.authorization_version
-                or row.user.status != "active"
-                or row.user.deleted_at is not None
-            ):
-                row.revoked_at = now
-                failure = "authentication cookie has expired"
-            elif touch:
-                row.last_seen_at = now
-                # Limit sliding TTL: extend the absolute expiry up to a maximum of the original
-                # session TTL (8 hours), not indefinitely. This prevents sessions from lasting forever
-                # by sliding beyond the initial intended session lifetime.
-                max_absolute_expiry = row.issued_at + timedelta(seconds=self.ttl_s)
-                row.expires_at = min(now + timedelta(seconds=self.ttl_s), max_absolute_expiry)
-            if failure is not None:
-                await sandbox_lifecycle_service.release_auth_session_in_transaction(
-                    session,
-                    user_id=row.user_id,
-                    auth_session_id=row.id,
-                    reason="auth.session.expired",
-                )
-            if failure is None:
-                claims = self._claims(row)
+            # Load the row even when it is already expired or revoked so the
+            # client receives the stable reason (session expiry versus an
+            # authorization change) instead of a generic invalid-cookie code.
+            row = await session.scalar(
+                select(SessionModel)
+                .options(joinedload(SessionModel.user))
+                .where(SessionModel.token_hash == digest)
+            )
+            claims, failure = await self._validate_session_row(
+                session, row, touch=touch, credential="cookie"
+            )
         if failure is not None:
-            raise AuthenticationError(failure)
+            raise failure
         assert claims is not None
         return claims
+
+    async def _validate_session_row(
+        self, session: AsyncSession, row: SessionModel | None, *, touch: bool, credential: str
+    ) -> tuple[DatabaseSessionClaims | None, AuthenticationError | None]:
+        """Apply the same expiry policy; callers commit cleanup before raising."""
+        if row is None:
+            message = "authentication cookie is invalid" if credential == "cookie" else "authentication session is expired"
+            return None, AuthenticationError(message)
+        failure: AuthenticationError | None = None
+        now = _utc_now()
+        prefix = f"authentication {credential}"
+        if row.expires_at <= now:
+            failure = AuthenticationError(f"{prefix} has expired")
+        elif row.revoked_at is not None:
+            if row.authorization_version != row.user.authorization_version:
+                failure = AuthorizationChangedError("authorization changed")
+            else:
+                failure = AuthenticationError(f"{prefix} is invalid" if credential == "cookie" else f"{prefix} is revoked")
+        elif row.last_seen_at is not None and (
+            now - row.last_seen_at
+        ).total_seconds() > self.idle_timeout_s:
+            row.revoked_at = now
+            failure = AuthenticationError(f"{prefix} has expired")
+        elif row.authorization_version != row.user.authorization_version:
+            row.revoked_at = now
+            failure = AuthorizationChangedError("authorization changed")
+        elif row.user.status != "active" or row.user.deleted_at is not None:
+            row.revoked_at = now
+            failure = AuthenticationError(f"{prefix} has expired")
+        elif touch:
+            row.last_seen_at = now
+            if credential == "cookie":
+                # Preserve the HTTP sliding cap; WebSocket activity never extends expiry.
+                max_absolute_expiry = row.issued_at + timedelta(seconds=self.ttl_s)
+                row.expires_at = min(now + timedelta(seconds=self.ttl_s), max_absolute_expiry)
+        if failure is not None:
+            await sandbox_lifecycle_service.release_auth_session_in_transaction(
+                session,
+                user_id=row.user_id,
+                auth_session_id=row.id,
+                reason="auth.session.expired",
+            )
+            return None, failure
+        return self._claims(row), None
 
     async def _active_row(
         self, session: AsyncSession, token_hash: str
@@ -504,12 +635,16 @@ class DatabaseSessionAuth:
                 .where(SessionModel.id == row.auth_session_id)
                 .with_for_update()
             )
-            if auth_session is None or auth_session.revoked_at is not None:
+            if auth_session is None:
+                raise AuthenticationError("authentication session is revoked")
+            if auth_session.revoked_at is not None:
+                if auth_session.authorization_version != auth_session.user.authorization_version:
+                    raise AuthorizationChangedError("authorization changed")
                 raise AuthenticationError("authentication session is revoked")
             if auth_session.expires_at <= now or auth_session.user.status != "active" or auth_session.user.deleted_at is not None:
                 raise AuthenticationError("authentication session is expired")
             if auth_session.authorization_version != auth_session.user.authorization_version:
-                raise AuthenticationError("authentication session is expired")
+                raise AuthorizationChangedError("authorization changed")
             row.used_at = now
             return self._claims(auth_session)
 
@@ -526,16 +661,13 @@ class DatabaseSessionAuth:
                 .options(joinedload(SessionModel.user))
                 .where(SessionModel.id == session_id)
             )
-            now = _utc_now()
-            if row is None or row.revoked_at is not None or row.expires_at <= now:
-                raise AuthenticationError("authentication session is expired")
-            if row.user.status != "active" or row.user.deleted_at is not None:
-                raise AuthenticationError("authentication session is expired")
-            if row.authorization_version != row.user.authorization_version:
-                raise AuthenticationError("authentication session is expired")
-            if touch:
-                row.last_seen_at = now
-            return self._claims(row)
+            claims, failure = await self._validate_session_row(
+                session, row, touch=touch, credential="session"
+            )
+        if failure is not None:
+            raise failure
+        assert claims is not None
+        return claims
 
     def require_csrf(
         self, claims: DatabaseSessionClaims, supplied: str | None

@@ -19,6 +19,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyCookie
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -29,19 +31,23 @@ from core.identity import AccessDeniedError, AuthenticatedPrincipal
 from core.rbac import Permission, ResourceRef, authorization_service
 from core.authorization_audit import begin as begin_authorization_audit, end as end_authorization_audit
 from gateway.contracts import (
+    AdmissionLimitError,
     GatewayNotStartedError,
     InjectMessageRequest,
     KnowledgeBookRevisionConflictError,
     ResourceNotFoundError,
     SubmitTurnRequest,
     TurnConflictError,
+    WorkerUnavailableError,
     WhiteboardLibraryInUseError,
 )
 from gateway.core import BackendGateway
 from server.infrastructure.mysql.models import ClassroomModel
 from server.web.auth import (
     AuthenticationError,
+    AuthorizationChangedError,
     CsrfRejectedError,
+    LoginRateLimitError,
     OriginRejectedError,
     SameOriginSessionAuth,
     SessionClaims,
@@ -59,6 +65,7 @@ from server.quota.notifications import (
 from server.quota.operations import QuotaOperationsService
 from server.quota.service import QuotaService
 from server.session.summary import summary_sweep_loop
+from server.storage.transfer_service import maintain_file_transfers
 from server.web.contracts import (
     CreateSessionBody,
     CreateWhiteboardLibraryBody,
@@ -176,7 +183,8 @@ from server.web.feedback import (
 from server.auth.dependencies import get_db_session
 from server.auth import code_store
 from server.auth.captcha import generate_captcha_image
-from server.user.schemas import EmailCodeRequest, UserRegister
+from server.classroom_join.service import ClassJoinError
+from server.user.schemas import EmailCodeRequest, EmailUserRegister, UserRegister
 from server.user.service import (
     EmailAlreadyUsedError,
     InvalidCaptchaError,
@@ -193,7 +201,10 @@ from server.user.email_provider import (
 )
 from server.user.email import InvalidEmailError, normalize_email
 
-DbSession = Annotated[AsyncSession, Depends(get_db_session)]
+# CAPTCHA, email-code and registration responses must follow their commit.
+# Request-scope teardown can run after bytes have reached the browser, allowing
+# an immediate follow-up request to miss the just-created code/audit/user.
+DbSession = Annotated[AsyncSession, Depends(get_db_session, scope="function")]
 
 
 GatewayFactory = Callable[[], BackendGateway]
@@ -201,6 +212,25 @@ GatewayFactory = Callable[[], BackendGateway]
 # Strong references to in-flight authorization-audit flush tasks so the
 # deferred writes survive garbage collection until they finish.
 _pending_audit_tasks: set[asyncio.Task] = set()
+
+
+def _is_registration_unique_conflict(error: IntegrityError) -> bool:
+    """Return True only for identity uniqueness conflicts during registration."""
+    original = getattr(error, "orig", None)
+    text = str(original if original is not None else error).casefold()
+    is_unique_violation = "duplicate" in text or "unique constraint" in text
+    return is_unique_violation and any(
+        marker in text
+        for marker in (
+            "uq_nlp_users_phone_number",
+            "uq_nlp_users_phone_number_normalized",
+            "uq_nlp_users_username_lower",
+            "key 'phone_number'",
+            "key 'phone_number_normalized'",
+            "key 'username_lower'",
+            "email_normalized",
+        )
+    )
 
 
 class SpaStaticFiles(StaticFiles):
@@ -278,6 +308,7 @@ def _problem(
     title: str,
     detail: str | None = None,
     extra: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None)
     body: dict[str, Any] = {
@@ -292,7 +323,12 @@ def _problem(
         body["request_id"] = request_id
     if extra:
         body.update(extra)
-    return JSONResponse(body, status_code=status_code, media_type="application/problem+json")
+    return JSONResponse(
+        body,
+        status_code=status_code,
+        media_type="application/problem+json",
+        headers=headers,
+    )
 
 
 def _is_quota_schema_mismatch(error: OperationalError) -> bool:
@@ -475,6 +511,13 @@ def create_app(
             usage_reader = injected_usage_reader
             quota_read_service = injected_quota_read_service
         app.state.quota_usage_reporter = usage_reporter
+        if usage_reporter is not None and gateway.authorization_session_factory is not None:
+            from server.model_usage.quota import DurableQuotaUsageReporter
+            from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+            usage_reporter = DurableQuotaUsageReporter(gateway.authorization_session_factory, downstream_reporter=usage_reporter)
+            configure_global_model_usage_reporter(usage_reporter, required=True)
+            app.state.quota_usage_reporter = usage_reporter
         app.state.quota_usage_reader = usage_reader
         app.state.quota_read_service = quota_read_service
         app.state.quota_management = quota_management
@@ -521,7 +564,7 @@ def create_app(
                         user_id = str(payload["user_id"])
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                         continue
-                    await hub.close_user(user_id, reason="authorization changed")
+                    await hub.revalidate_user(user_id)
             except asyncio.CancelledError:
                 raise
             finally:
@@ -608,7 +651,6 @@ def create_app(
             asyncio.create_task(reconcile_sandbox_leases(), name="sandbox-lease-reconciler")
             if gateway.authorization_session_factory is not None else None
         )
-
         async def run_summary_sweep() -> None:
             # Durable backfill for titles lost to a restart; the lease claim in
             # ``generate_and_store_summary`` deduplicates it against the Worker.
@@ -618,12 +660,36 @@ def create_app(
             asyncio.create_task(run_summary_sweep(), name="session-summary-sweep")
             if gateway.authorization_session_factory is not None else None
         )
+        file_transfer_reconcile_interval_s = max(
+            10, int(web_config.get("file_transfer_reconcile_interval_s", 60))
+        )
+
+        async def reconcile_file_transfers() -> None:
+            factory = gateway.authorization_session_factory
+            if factory is None:
+                return
+            while True:
+                try:
+                    await maintain_file_transfers(factory)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("file transfer reconciliation pass failed")
+                await asyncio.sleep(file_transfer_reconcile_interval_s)
+
+        file_transfer_reconciler = (
+            asyncio.create_task(reconcile_file_transfers(), name="file-transfer-reconciler")
+            if gateway.authorization_session_factory is not None else None
+        )
         try:
             yield
         finally:
             if summary_sweeper is not None:
                 summary_sweeper.cancel()
                 await asyncio.gather(summary_sweeper, return_exceptions=True)
+            if file_transfer_reconciler is not None:
+                file_transfer_reconciler.cancel()
+                await asyncio.gather(file_transfer_reconciler, return_exceptions=True)
             if sandbox_reconciler is not None:
                 sandbox_reconciler.cancel()
                 await asyncio.gather(sandbox_reconciler, return_exceptions=True)
@@ -637,6 +703,10 @@ def create_app(
                 quota_snapshot_publisher.close()
             if sandbox_manager is not None:
                 await sandbox_manager.close()
+            if usage_reporter is not None:
+                from core.model_runtime.reporters import configure_global_model_usage_reporter
+
+                configure_global_model_usage_reporter(None)
             await sandbox_model_service.close()
             from server.tools.academic.service import close_academic_search_service
 
@@ -847,13 +917,56 @@ def create_app(
         SessionClaims | DatabaseSessionClaims, Depends(write_access)
     ]
 
-    @app.exception_handler(AuthenticationError)
-    async def authentication_error(request: Request, _error: AuthenticationError):
+    @app.exception_handler(LoginRateLimitError)
+    async def login_rate_limit_error(request: Request, error: LoginRateLimitError):
+        response = _problem(
+            request,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code="login_rate_limited",
+            title="Too many login attempts",
+            detail="Try again after the login cooldown.",
+            extra={"retry_after_s": error.retry_after_s},
+        )
+        response.headers["Retry-After"] = str(error.retry_after_s)
+        return response
+
+    @app.exception_handler(AuthorizationChangedError)
+    async def authorization_changed_error(request: Request, _error: AuthorizationChangedError):
         return _problem(
             request,
             status_code=status.HTTP_401_UNAUTHORIZED,
-            code="authentication_required",
+            code="authorization_changed",
+            title="Authorization changed",
+            detail="账号权限已更新，请重新登录",
+        )
+
+    @app.exception_handler(AuthenticationError)
+    async def authentication_error(request: Request, error: AuthenticationError):
+        if request.url.path.rstrip("/").endswith("/auth/login"):
+            code = "authentication_required"
+            detail = "账号或密码错误"
+        elif str(error) == "authentication cookie has expired":
+            code = "session_expired"
+            detail = "登录已过期，请重新登录"
+        else:
+            code = "authentication_required"
+            detail = None
+        return _problem(
+            request,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            code=code,
             title="Authentication required",
+            detail=detail,
+        )
+
+    @app.exception_handler(ClassJoinError)
+    async def classroom_join_error(request: Request, error: ClassJoinError):
+        return _problem(
+            request,
+            status_code=error.status_code,
+            code=error.code,
+            title="Classroom join request failed",
+            detail=error.detail,
         )
 
     @app.exception_handler(OriginRejectedError)
@@ -913,6 +1026,21 @@ def create_app(
             detail=str(error),
         )
 
+    @app.exception_handler(AdmissionLimitError)
+    async def admission_limit_error(request: Request, error: AdmissionLimitError):
+        titles = {
+            AdmissionLimitError.QUEUE_CAPACITY_EXCEEDED: "Classroom queue is full",
+            AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED: "Too many active turns",
+            AdmissionLimitError.MODEL_QUOTA_EXCEEDED: "Model usage quota exceeded",
+        }
+        return _problem(
+            request,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            code=error.code,
+            title=titles[error.code],
+            headers={"Retry-After": "5"},
+        )
+
     @app.exception_handler(GatewayNotStartedError)
     async def gateway_error(request: Request, _error: GatewayNotStartedError):
         return _problem(
@@ -920,6 +1048,29 @@ def create_app(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             code="gateway_unavailable",
             title="Backend Gateway is not ready",
+        )
+
+    @app.exception_handler(WorkerUnavailableError)
+    async def worker_unavailable(request: Request, _error: WorkerUnavailableError):
+        return _problem(
+            request,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="worker_unavailable",
+            title="No healthy classroom workers are available",
+            headers={"Retry-After": "5"},
+        )
+
+    @app.exception_handler(SQLAlchemyError)
+    async def database_error(request: Request, error: SQLAlchemyError):
+        from server.infrastructure.mysql.errors import database_problem
+
+        code, title, retry_after = database_problem(error)
+        return _problem(
+            request,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code=code,
+            title=title,
+            headers={"Retry-After": retry_after} if retry_after else None,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -950,14 +1101,22 @@ def create_app(
     async def health_ready(request: Request):
         health = await request.app.state.gateway.health()
         ready = health.started and health.accepting_turns and health.status == "ok"
+        from server.storage.monitoring import deployment_environment
+
         return JSONResponse(
             {
                 "status": "ready" if ready else "not_ready",
+                "deployment_environment": deployment_environment(),
                 "active_turns": health.active_turns,
                 "durable_events": health.durable_events,
             },
             status_code=200 if ready else 503,
         )
+
+    @app.get("/api/v1/observability/runtime", tags=["observability"])
+    async def runtime_observability(request: Request, principal: Principal):
+        authorization_service.require(principal, Permission.SYSTEM_RUNTIME_MONITOR)
+        return await request.app.state.gateway.runtime_metrics()
 
     @app.get("/api/v1/auth/captcha", tags=["auth"])
     async def get_captcha(db: DbSession):
@@ -986,7 +1145,7 @@ def create_app(
           - per-email cooldown / per-email hourly / per-IP hourly send limits;
           - real delivery via the configured email provider; missing production
             configuration returns 503 and never prints the verification code;
-        - the code is stored hashed with a hard 120s expiry enforced at
+        - the code is stored hashed with the shared verification-policy expiry enforced at
           consumption time.
         """
         await code_store.purge_expired(db)
@@ -1012,7 +1171,15 @@ def create_app(
                 if provider is not None:
                     if not await provider.send_verification_code(email, code):
                         await code_store.record_email_send(db, email=email, client_ip=client_ip, outcome="failed")
-                        return JSONResponse({"detail": "Email gateway failed to deliver the code"}, status_code=status.HTTP_502_BAD_GATEWAY)
+                        # Return a response so the failed-send audit and consumed
+                        # CAPTCHA are committed by the request dependency.
+                        return _problem(
+                            request,
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            code="email_gateway_failed",
+                            title="Email gateway failed",
+                            detail="Email gateway failed to deliver the code",
+                        )
                 else:
                     if development_email_code_logging_enabled():
                         logger.warning(
@@ -1031,7 +1198,20 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="email_send_busy") from error
         except EmailConfigurationError as error:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
-        return {"message": "Email code sent successfully"}
+        return {"message": "Email code sent successfully",
+                "expires_in": code_store.EMAIL_CODE_TTL_S,
+                "resend_after": code_store.EMAIL_RESEND_COOLDOWN_S}
+
+    @app.post("/api/v1/auth/sms/send", tags=["auth"], deprecated=True)
+    async def send_sms_code(request: Request):
+        """Tell stale clients to use email; do not access storage or providers."""
+        return _problem(
+            request,
+            status_code=status.HTTP_410_GONE,
+            code="sms_registration_disabled",
+            title="SMS registration is disabled",
+            detail="Use email verification to register",
+        )
 
     @app.post("/api/v1/auth/login", status_code=status.HTTP_200_OK, tags=["auth"])
     async def login(body: LoginBody, request: Request, response: Response):
@@ -1115,11 +1295,12 @@ def create_app(
         }
 
     @app.post("/api/v1/auth/register", status_code=status.HTTP_201_CREATED, tags=["auth"])
-    async def register_user(body: UserRegister, db: DbSession):
-        """Register an email account through the unified user service."""
+    async def register_user(body: EmailUserRegister, db: DbSession):
+        """Register a verified email account without creating a session."""
         service = UserService(db)
         try:
-            user = await service.register_user(body)
+            user = await service.register_user(UserRegister(**body.model_dump()))
+            roles = await service.get_roles_for_users([user.id])
         except InvalidCaptchaError as error:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
@@ -1134,11 +1315,22 @@ def create_app(
             ) from error
         except InvalidEmailError as error:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(error)) from error
+        except IntegrityError as error:
+            # Identity lookups improve the message; the database unique keys
+            # remain authoritative when registrations race.
+            await db.rollback()
+            if _is_registration_unique_conflict(error):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This registration identity is already in use",
+                ) from error
+            raise
         return {
             "message": "User registered successfully",
             "user_id": user.id,
             "username": user.username,
             "display_name": user.display_name,
+            "roles": roles.get(user.id, []),
         }
 
     @app.post("/api/v1/auth/guest", status_code=status.HTTP_200_OK, tags=["auth"])
@@ -2311,7 +2503,7 @@ def create_app(
         async with authorization_session_factory(request)() as session:
             async with session.begin():
                 row = await rbac_service.create_classroom(session, workspace_id=body.workspace_id, name=body.name, actor_user_id=principal.user_id)
-        return {"id": row.id, "workspace_id": row.workspace_id, "name": row.name, "status": row.status}
+        return {"id": row.id, "workspace_id": row.workspace_id, "name": row.name, "join_code": row.join_code, "status": row.status}
 
     @app.put("/api/v1/classrooms/{classroom_id}/members/{user_id}", tags=["rbac"])
     async def replace_classroom_member(classroom_id: str, user_id: str, body: ReplaceClassroomMemberBody, request: Request, principal: Principal, _claims: WriteClaims):

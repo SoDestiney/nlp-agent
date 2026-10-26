@@ -9,6 +9,9 @@ import { LoginPage } from "./LoginPage";
 
 vi.mock("@/platform/http/api", () => ({
   AUTH_EXPIRED_EVENT: "nova:auth-expired",
+  AuthStateChangedError: class extends Error {},
+  getAuthGeneration: () => 0,
+  subscribeAuthChanges: () => () => undefined,
   ensureAuth: vi.fn(),
   api: {
     login: vi.fn(),
@@ -33,6 +36,7 @@ describe("LoginPage", () => {
     vi.mocked(api.getCaptcha).mockReset();
     vi.mocked(api.getCaptcha).mockResolvedValue({ captcha_id: "captcha-1", image: "data:image/png;base64,abc" });
     vi.mocked(api.sendEmailCode).mockReset();
+    vi.mocked(api.register).mockReset();
   });
 
   it("logs in with the database account and returns to the protected destination", async () => {
@@ -101,7 +105,7 @@ describe("LoginPage", () => {
       .mockResolvedValueOnce({ captcha_id: "email-2", image: "data:image/png;base64,email2" });
     let finishSending!: () => void;
     vi.mocked(api.sendEmailCode).mockImplementation(() => new Promise((resolve) => {
-      finishSending = () => resolve({ message: "sent" });
+      finishSending = () => resolve({ message: "sent", expires_in: 300, resend_after: 60 });
     }));
     render(
       <MemoryRouter initialEntries={["/login"]}>
@@ -114,16 +118,16 @@ describe("LoginPage", () => {
     fireEvent.change(email, { target: { value: "first@example.com" } });
     fireEvent.change(await screen.findByPlaceholderText("输入图中字符"), { target: { value: "ABCD" } });
 
-    const captcha = await screen.findByAltText("验证码");
-    expect(captcha).toHaveClass("h-16", "w-40");
     fireEvent.click(screen.getByRole("button", { name: "发送验证码" }));
     expect(email).toBeDisabled();
     finishSending();
     await waitFor(() => expect(screen.getByPlaceholderText("6位验证码")).toBeEnabled());
+    const captcha = await screen.findByAltText("注册验证码");
+    expect(captcha).toHaveClass("h-16", "w-40");
+    expect(api.sendEmailCode).toHaveBeenCalledWith("first@example.com", "email-1", "ABCD");
 
     fireEvent.change(email, { target: { value: "second@example.com" } });
     expect(screen.getByPlaceholderText("6位验证码")).toBeDisabled();
-    expect(screen.queryByText("注册验证")).not.toBeInTheDocument();
     await waitFor(() => expect(api.getCaptcha).toHaveBeenCalledTimes(3));
     expect(screen.getByAltText("验证码")).toHaveAttribute("src", "data:image/png;base64,email2");
   });

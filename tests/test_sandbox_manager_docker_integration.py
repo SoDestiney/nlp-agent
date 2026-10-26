@@ -70,6 +70,62 @@ def _remove_container(name: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.getenv("NLP_AGENT_DOCKER_RUNTIME") != "runsc", reason="requires the real runsc runtime image")
+async def test_real_scratch_obeys_host_guard_and_survives_concurrent_reconcile(monkeypatch, tmp_path) -> None:
+    """Use actual MySQL, runsc, cancellation-safe flock and Docker --rm."""
+    from unittest.mock import AsyncMock
+
+    from configs.settings import settings
+    from server.infrastructure.mysql import DatabaseConfig, create_engine, create_session_factory
+    from server.sandbox.docker_runtime import DockerRuntimeAdapter, DockerRuntimeConfig
+    from server.sandbox.manager import WarmPoolManager
+
+    namespace = "scratch-admission-" + uuid4().hex[:12]
+    inspected = _run_docker(["image", "inspect", TEST_IMAGE, "--format", "{{.Id}}"], timeout=30)
+    assert inspected.returncode == 0
+    adapter = DockerRuntimeAdapter(DockerRuntimeConfig(
+        image=inspected.stdout.strip(), allow_local_image_id=True, namespace=namespace, memory="512m",
+    ))
+    monkeypatch.setattr(settings, "NLP_AGENT_SANDBOX_HOST_LOCK_FILE", str(tmp_path / "host.lock"))
+    monkeypatch.setattr(settings, "NLP_AGENT_SANDBOX_HOST_MEMORY_RESERVE_MB", 256)
+    monkeypatch.setattr(settings, "NLP_AGENT_SANDBOX_HOST_DISK_RESERVE_GB", 1)
+    monkeypatch.setattr(settings, "NLP_AGENT_SANDBOX_HOST_RUNTIME_TOTAL_MAX", 16)
+    monkeypatch.setattr(settings, "NLP_AGENT_SANDBOX_RUNTIME_TOTAL_MAX", 4)
+    engine = create_engine(DatabaseConfig(os.environ["NLP_AGENT_DATABASE_URL"], pool_size=2, max_overflow=0))
+    manager = WarmPoolManager(session_factory=create_session_factory(engine), docker=adapter,
+                              resource_profile_id=namespace, ready_target=0, require_host_lock=True)
+    tasks = []
+    try:
+        scratch = asyncio.create_task(manager.run_scratch(source="import time\ntime.sleep(2)\nprint('SCRATCH_OK')"))
+        tasks.append(scratch)
+        deadline = asyncio.get_running_loop().time() + 12
+        while not await adapter.managed_runtime_ids():
+            assert not scratch.done(), "scratch must reach a real, live container"
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        reconciliation = asyncio.create_task(manager.reconcile())
+        tasks.append(reconciliation)
+        await asyncio.sleep(0.1)
+        assert not reconciliation.done(), "reconcile must wait for the scratch host reservation"
+        result, actions = await asyncio.gather(scratch, reconciliation)
+        assert result["status"] == "completed" and result["stdout"].strip() == "SCRATCH_OK"
+        assert not actions.destroy_orphans, "a live scratch must never be selected as an orphan"
+        assert not await adapter.managed_runtime_ids(), "--rm must release the slot"
+        monkeypatch.setattr(manager, "_host_allows_create", AsyncMock(return_value=False))
+        with pytest.raises(RuntimeError, match="resource reserve"):
+            await manager.run_scratch(source="print('must not start')")
+        assert not await adapter.managed_runtime_ids()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for identifier in await adapter.managed_runtime_ids():
+            _remove_container(identifier)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_manager_destroys_unregistered_managed_container() -> None:
     from server.infrastructure.mysql import DatabaseConfig, create_engine, create_session_factory
     from server.sandbox.docker_runtime import DockerRuntimeAdapter, DockerRuntimeConfig
@@ -371,3 +427,173 @@ async def test_reset_claim_execute_uses_new_environment_generation() -> None:
         assert result["status"] == "completed"
     finally:
         await engine.dispose()
+
+
+def test_measured_profile_real_http_rpc_runsc_lifecycle(monkeypatch) -> None:
+    """Exercise the production Web/RPC/Manager boundary on disposable CI resources."""
+    import json
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import ExitStack
+
+    import httpx
+
+    from tests.api_http.support.auth import login, same_origin_headers
+    from tests.api_http.support.database import MySqlProbe
+    from tests.api_http.support.environment import ManagedHttpEnvironment, _redact_diagnostics
+
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        pytest.skip("full real-kernel HTTP lifecycle uses a dedicated GitHub runner")
+    # The other integration cases use the job's separate CI database. This
+    # harness always creates its own database and refuses inherited URLs.
+    for key in ("DATABASE_URL", "REDIS_URL", "NLP_AGENT_DATABASE_URL", "NLP_AGENT_REDIS_URL",
+                "MYSQL_URL", "API_HTTP_DATABASE_URL", "API_HTTP_REDIS_URL"):
+        monkeypatch.delenv(key, raising=False)
+    inspected = _run_docker(["image", "inspect", TEST_IMAGE, "--format", "{{.Id}}"], timeout=30)
+    assert inspected.returncode == 0, "the CI runtime image must already be built"
+    environment = ManagedHttpEnvironment.start(real_sandbox_image=inspected.stdout.strip())
+    probe = MySqlProbe(environment.env["NLP_AGENT_DATABASE_URL"])
+    try:
+        with ExitStack() as clients_stack:
+            clients = {}
+            for role in ("student", "teacher", "developer", "guest"):
+                client = clients_stack.enter_context(httpx.Client(
+                    base_url=environment.web_base_url, timeout=90, trust_env=False,
+                ))
+                user = environment.users[role]
+                login(client, origin=environment.web_origin, username=user.username, password=user.password)
+                clients[role] = client
+
+            def write(role, route, payload=None, *, method="POST"):
+                client = clients[role]
+                session = client.get("/api/v1/auth/session")
+                assert session.status_code == 200, "an existing session must remain available"
+                return client.request(method, route, json=payload, headers=same_origin_headers(
+                    environment.web_origin, csrf_token=session.json()["csrf_token"],
+                ))
+
+            def claim(role, *, wait=True):
+                deadline = time.monotonic() + (60 if wait else 0)
+                while True:
+                    response = write(role, "/api/v1/sandbox/lease")
+                    assert response.status_code == 200, (
+                        f"claim HTTP status {response.status_code}: "
+                        + _redact_diagnostics(response.text)[:1000]
+                    )
+                    payload = response.json()
+                    if payload["runtime_available"]:
+                        return payload["runtime"]
+                    assert payload["pool_status"] == "warming"
+                    if not wait:
+                        return None
+                    assert time.monotonic() < deadline, "the real pool did not replenish"
+                    time.sleep(1)
+
+            def execute(role, ticket, source):
+                response = write(role, "/api/v1/sandbox/execute", {"ticket": ticket, "source": source})
+                assert response.status_code == 200, f"execution HTTP status {response.status_code}"
+                payload = response.json()
+                assert payload["status"] == "completed", "real kernel execution did not complete"
+                return payload
+
+            def eventually(predicate, description):
+                deadline = time.monotonic() + 45
+                while not predicate():
+                    assert time.monotonic() < deadline, description
+                    time.sleep(1)
+
+            def external_id(runtime):
+                return probe.scalar(
+                    "SELECT external_runtime_id FROM nlp_sandbox_runtime_instances WHERE id=:id",
+                    id=runtime["id"],
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {role: pool.submit(claim, role) for role in ("student", "teacher")}
+                runtimes = {role: future.result() for role, future in futures.items()}
+                assert runtimes["student"]["id"] != runtimes["teacher"]["id"]
+                owned_ids = [external_id(runtime) for runtime in runtimes.values()]
+                assert len(set(owned_ids)) == 2
+                for owned_id in owned_ids:
+                    result = _run_docker(["inspect", owned_id], timeout=30)
+                    assert result.returncode == 0
+                    container = json.loads(result.stdout)[0]
+                    assert container["Image"] == inspected.stdout.strip()
+                    assert container["HostConfig"]["Memory"] == 512 * 1024 * 1024
+                    assert container["HostConfig"]["NanoCpus"] == 1_000_000_000
+                    assert container["HostConfig"]["Runtime"] == "runsc"
+                    assert container["HostConfig"]["NetworkMode"] == "none"
+                    assert container["HostConfig"]["ReadonlyRootfs"]
+
+                code = (
+                    "assert 'owner_marker' not in globals()\n"
+                    "owner_marker = {marker!r}\n"
+                    "assert sum(range(100000)) == 4999950000\n"
+                    "import csv, io\n"
+                    "rows=list(csv.DictReader(io.StringIO('n,v\\n'+''.join(f'{{i}},{{i*2}}\\n' for i in range(20000)))))\n"
+                    "assert sum(int(row['v']) for row in rows) == 399980000\n"
+                    "import torch\n"
+                    "torch.set_num_threads(1)\n"
+                    "matrix=torch.ones((256,256))\n"
+                    "assert float((matrix @ matrix)[0,0]) == 256.0\n"
+                    "print('MIXED_PROFILE_OK')\n"
+                )
+                executions = {role: pool.submit(execute, role, runtime["ticket"], code.format(marker=role))
+                              for role, runtime in runtimes.items()}
+                # A developer management request goes through the same Web/DB
+                # while actual kernels are executing in the separate Manager.
+                assert clients["developer"].get("/api/v1/users").status_code == 200
+                assert clients["developer"].get("/api/v1/quota/me").status_code == 200
+                results = {role: future.result() for role, future in executions.items()}
+                for role, result in results.items():
+                    assert result["stdout"].strip() == "MIXED_PROFILE_OK"
+                    continued = execute(role, result["ticket"], f"assert owner_marker == {role!r}\nprint('STATE_OK')")
+                    assert continued["stdout"].strip() == "STATE_OK"
+                replay = write("student", "/api/v1/sandbox/execute", {
+                    "ticket": runtimes["student"]["ticket"], "source": "print('must not execute')",
+                })
+                assert replay.status_code == 403, "the first-claim nonce must not be replayable"
+                foreign = write("teacher", "/api/v1/sandbox/execute", {
+                    "ticket": results["student"]["ticket"], "source": "print('must not execute')",
+                })
+                assert foreign.status_code == 403, "tickets must remain scoped to the owner/session"
+
+            claim("guest")
+            assert claim("developer", wait=False) is None, "a full pool must return warming without a 503"
+            student_external_id = external_id(runtimes["student"])
+            assert write("student", "/api/v1/auth/session", method="DELETE").status_code == 204
+            eventually(lambda: probe.scalar(
+                "SELECT state FROM nlp_sandbox_runtime_instances WHERE id=:id",
+                id=runtimes["student"]["id"],
+            ) == "destroyed", "logout must destroy the user's assigned runtime")
+            assert _run_docker(["inspect", student_external_id], timeout=30).returncode != 0
+            replacement = claim("developer")
+            assert replacement["id"] != runtimes["student"]["id"]
+            fresh = execute("developer", replacement["ticket"], "assert 'owner_marker' not in globals()\nprint('CLEAN_OK')")
+            assert fresh["stdout"].strip() == "CLEAN_OK"
+
+            assert write("guest", "/api/v1/auth/session", method="DELETE").status_code == 204
+            eventually(lambda: probe.scalar(
+                "SELECT COUNT(*) FROM nlp_sandbox_runtime_instances WHERE state='ready_unbound'",
+            ) >= 1, "logout must leave room for the adaptive pool to replenish")
+            reset = write("developer", "/api/v1/sandbox/restart", {"ticket": fresh["ticket"]})
+            assert reset.status_code == 200 and reset.json()["status"] == "restarted"
+            new_generation = claim("developer")
+            assert new_generation["id"] != replacement["id"]
+            assert new_generation["generation"] > replacement["generation"]
+            assert write("developer", "/api/v1/sandbox/execute", {
+                "ticket": fresh["ticket"], "source": "print('must not execute')",
+            }).status_code == 403
+            assert execute("developer", new_generation["ticket"], "print('RESET_OK')")["stdout"].strip() == "RESET_OK"
+            for role in ("developer", "teacher"):
+                assert write(role, "/api/v1/auth/session", method="DELETE").status_code == 204
+            eventually(lambda: probe.scalar("SELECT COUNT(*) FROM nlp_sandbox_leases WHERE state='active'") == 0,
+                       "all test-owned leases must be released")
+            print("REAL_HTTP_RPC_RUNSC_LIFECYCLE_PASSED: mixed code, owner isolation, nonce fencing, "
+                  "management availability, full-pool backpressure, logout destroy/refill and reset", flush=True)
+    except Exception:
+        print(_redact_diagnostics(environment.diagnostics()))
+        raise
+    finally:
+        probe.close()
+        environment.close()

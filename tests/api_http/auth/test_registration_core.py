@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -11,12 +12,14 @@ from ..support.auth import set_test_auth_code
 from ..support.database import MySqlProbe
 from ..support.http import json_response, problem_response
 from server.user.email import normalize_email
+from server.user.phone import normalize_phone_number
 
 
 pytestmark = pytest.mark.api_core
 
 CAPTCHA_CODE = "ABCD"
 EMAIL_CODE = "123456"
+SMS_CODE = "654321"
 
 
 def _unique_email(prefix: str = "user") -> str:
@@ -92,6 +95,31 @@ def _register(
     )
 
 
+def _register_phone(
+    client: httpx.Client,
+    mysql_probe: MySqlProbe,
+    phone: str,
+) -> httpx.Response:
+    captcha_id = _captcha(client, mysql_probe)
+    set_test_auth_code(
+        mysql_probe,
+        kind="sms",
+        subject=normalize_phone_number(phone),
+        code=SMS_CODE,
+    )
+    return client.post(
+        "/api/v1/auth/register",
+        json={
+            "phone_number": phone,
+            "sms_code": SMS_CODE,
+            "password": "Phase4-register-password!",
+            "display_name": "Phone Registered User",
+            "captcha_id": captcha_id,
+            "captcha_code": CAPTCHA_CODE,
+        },
+    )
+
+
 def test_captcha_is_json_and_single_use(
     http_client: httpx.Client,
     mysql_probe: MySqlProbe,
@@ -135,6 +163,7 @@ def test_captcha_rejects_wrong_and_expired_answers(
     assert expired.status_code == 400
 
 
+@pytest.mark.api_smoke
 def test_email_code_lifecycle_and_registration_provision_resources(
     http_client: httpx.Client,
     mysql_probe: MySqlProbe,
@@ -144,11 +173,14 @@ def test_email_code_lifecycle_and_registration_provision_resources(
 ) -> None:
     email = _unique_email()
     sent = _send_email(http_client, mysql_probe, email)
-    json_response(sent, 200)
+    sent_payload = json_response(sent, 200)
+    assert sent_payload["expires_in"] == 300
+    assert sent_payload["resend_after"] == 60
 
     registered = _register(http_client, mysql_probe, email=email)
     payload = json_response(registered, 201)
     assert isinstance(payload, dict)
+    assert "nlp_session" not in registered.headers.get("set-cookie", "")
     user_id = str(payload["user_id"])
     assert payload["username"].startswith("user")
 
@@ -160,6 +192,7 @@ def test_email_code_lifecycle_and_registration_provision_resources(
     assert isinstance(user, dict)
     assert user["roles"] == ["guest"]
     assert user["status"] == "active"
+    assert payload["roles"] == ["guest"]
 
     registered_login = api_http_client_factory(
         base_url=http_client.base_url,
@@ -178,6 +211,9 @@ def test_email_code_lifecycle_and_registration_provision_resources(
     assert isinstance(login_payload, dict)
     assert login_payload["user_id"] == user_id
     assert login_payload["workspace_ids"]
+    assert login_payload["roles"] == ["guest"]
+    assert "classroom:join_request:submit" in login_payload["permissions"]
+    assert "learning:progress:read_self" not in login_payload["permissions"]
 
 
 def test_email_wrong_expired_and_replayed_codes_are_rejected(
@@ -239,6 +275,67 @@ def test_email_resend_rate_limit_is_enforced(
     assert second.status_code == 429, second.text
 
 
+@pytest.mark.api_smoke
+def test_public_registration_rejects_phone_without_consuming_legacy_code(
+    http_client: httpx.Client,
+    mysql_probe: MySqlProbe,
+) -> None:
+    phone = f"139{uuid.uuid4().int % 10**8:08d}"
+    response = _register_phone(http_client, mysql_probe, phone)
+    problem_response(response, 422)
+    assert mysql_probe.scalar(
+        "SELECT COUNT(*) FROM nlp_users WHERE phone_number_normalized=:phone",
+        phone=normalize_phone_number(phone),
+    ) == 0
+    assert mysql_probe.scalar(
+        "SELECT COUNT(*) FROM nlp_auth_codes WHERE kind='sms' AND subject=:phone",
+        phone=normalize_phone_number(phone),
+    ) == 1
+
+
+@pytest.mark.api_smoke
+def test_concurrent_email_registrations_cannot_reuse_one_code(
+    http_client: httpx.Client,
+    mysql_probe: MySqlProbe,
+    api_http_client_factory,
+) -> None:
+    email = _unique_email("concurrent")
+    email_variants = (email, email.upper())
+    clients = [
+        api_http_client_factory(base_url=http_client.base_url, timeout=15)
+        for _ in email_variants
+    ]
+    requests = []
+    for client, email_variant in zip(clients, email_variants, strict=True):
+        captcha_id = _captcha(client, mysql_probe)
+        set_test_auth_code(
+            mysql_probe,
+            kind="email",
+            subject=normalize_email(email_variant),
+            code=EMAIL_CODE,
+        )
+        requests.append(
+            {
+                "email": email_variant,
+                "email_code": EMAIL_CODE,
+                "password": "Phase4-register-password!",
+                "captcha_id": captcha_id,
+                "captcha_code": CAPTCHA_CODE,
+            }
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(
+            executor.map(
+                lambda pair: pair[0].post("/api/v1/auth/register", json=pair[1]),
+                zip(clients, requests, strict=True),
+            )
+        )
+
+    assert sorted(response.status_code for response in responses) == [201, 400]
+
+
+@pytest.mark.api_smoke
 def test_email_provider_failure_has_explicit_gateway_error(
     http_client: httpx.Client,
     mysql_probe: MySqlProbe,
@@ -254,7 +351,8 @@ def test_email_provider_failure_has_explicit_gateway_error(
             "captcha_code": CAPTCHA_CODE,
         },
     )
-    payload = json_response(response, 502)
+    payload = problem_response(response, 502)
+    assert payload["code"] == "email_gateway_failed"
     assert isinstance(payload, dict)
     assert "Email gateway failed" in str(payload["detail"])
     assert (
@@ -265,3 +363,13 @@ def test_email_provider_failure_has_explicit_gateway_error(
         )
         == 0
     )
+
+    assert mysql_probe.scalar(
+        "SELECT COUNT(*) FROM nlp_email_send_audits WHERE email=:email AND outcome='failed'",
+        email=normalize_email(email),
+    ) == 1
+    # A failed delivery still consumes the CAPTCHA; it cannot be replayed.
+    replay = http_client.post("/api/v1/auth/email/send", json={
+        "email": email, "captcha_id": captcha_id, "captcha_code": CAPTCHA_CODE,
+    })
+    assert replay.status_code == 400

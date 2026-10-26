@@ -1,4 +1,5 @@
 import { StudentSocket } from "./client";
+import { api } from "@/platform/http/api";
 
 class FakeWebSocket {
   static readonly CONNECTING = 0;
@@ -18,8 +19,27 @@ class FakeWebSocket {
 
 describe("StudentSocket", () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("fetches the default ticket when recovery is provided as the fourth callback", async () => {
+    const instances: FakeWebSocket[] = [];
+    vi.stubGlobal("WebSocket", class extends FakeWebSocket {
+      constructor(url: string) { super(url); instances.push(this); }
+    });
+    const ticket = vi.spyOn(api, "createWsTicket").mockResolvedValue({ ticket: "signed-ticket", expires_in: 30 });
+    const recover = vi.fn(async () => undefined);
+    const client = new StudentSocket(vi.fn(), vi.fn(), undefined, recover);
+    client.connect();
+    await vi.waitFor(() => expect(instances).toHaveLength(1));
+    expect(ticket).toHaveBeenCalledOnce();
+    expect(instances[0].url).toContain("ticket=signed-ticket");
+    instances[0].open();
+    instances[0].onmessage?.({ data: JSON.stringify({ type: "connection.ready", payload: {} }) });
+    expect(recover).toHaveBeenCalledOnce();
+    client.close();
   });
 
   it("uses the versioned backend command envelope and session subscription", async () => {
@@ -50,6 +70,47 @@ describe("StudentSocket", () => {
     const frames = instance.sent.map((value) => JSON.parse(value) as { type: string; v: string; payload: Record<string, unknown> });
     expect(frames[0]).toMatchObject({ v: "1", type: "session.subscribe", payload: { session_id: "session_1" } });
     expect(frames[1]).toMatchObject({ v: "1", type: "chat.send", payload: { session_id: "session_1", content: "hello", idempotency_key: "request_1", model_profile: "qwen", thinking_enabled: false, learning_context: { topic: "Transformer", level: "intermediate", mode: "practice" }, knowledge_book_context: { knowledge_point_id: "point-1", selected_text: "词元" } } });
+    client.close();
+  });
+
+  it("refreshes the HTTP auth session after every protocol-level reconnect", async () => {
+    const instances: FakeWebSocket[] = [];
+    const refreshSession = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("WebSocket", class extends FakeWebSocket {
+      constructor(url: string) { super(url); instances.push(this); }
+    });
+    const client = new StudentSocket(vi.fn(), vi.fn(), async () => "test-ticket", refreshSession);
+    client.setSession("session_1");
+    await Promise.resolve();
+    instances[0].open();
+    instances[0].onmessage?.({ data: JSON.stringify({ v: "1", type: "connection.ready", timestamp: new Date().toISOString(), payload: {} }) });
+
+    await Promise.resolve();
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+
+  it("waits for auth/history recovery before replaying commands", async () => {
+    const instances: FakeWebSocket[] = [];
+    vi.stubGlobal("WebSocket", class extends FakeWebSocket {
+      constructor(url: string) { super(url); instances.push(this); }
+    });
+    let release!: () => void;
+    const recovered = new Promise<void>((resolve) => { release = resolve; });
+    const status = vi.fn();
+    const client = new StudentSocket(vi.fn(), status, async () => "test-ticket", () => recovered);
+    client.setSession("session-1");
+    client.sendChat("session-1", "pending question", "request-1");
+    await Promise.resolve();
+    instances[0].open();
+    instances[0].onmessage?.({ data: JSON.stringify({ type: "connection.ready", payload: {} }) });
+    expect(instances[0].sent).toEqual([]);
+    expect(status).not.toHaveBeenCalledWith("connected");
+    release();
+    await recovered;
+    await Promise.resolve();
+    expect(status).toHaveBeenCalledWith("connected");
+    expect(instances[0].sent.map((frame) => JSON.parse(frame).type)).toEqual(["session.subscribe", "chat.send"]);
     client.close();
   });
 

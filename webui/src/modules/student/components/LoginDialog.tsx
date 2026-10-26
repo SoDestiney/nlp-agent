@@ -2,6 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { LockKeyhole, RefreshCw, X } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/platform/http/api";
+import { emailCodeNotice } from "@/shared/utils/emailCodeNotice";
 import { ConsentNotice, LegalDocumentModal } from "@/modules/auth/LegalConsent";
 import type { LegalDocumentKind } from "@/modules/auth/legalDocuments";
 
@@ -12,19 +13,26 @@ interface LoginDialogProps {
   expired?: boolean;
   onClose: () => void;
   onAuthenticate: (username: string, password: string) => Promise<void>;
+  notice?: string;
+  onNoticeDismiss?: () => void;
 }
 
-export function LoginDialog({ open, expired = false, onClose, onAuthenticate }: LoginDialogProps) {
+export function LoginDialog({ open, expired = false, onClose, onAuthenticate, notice, onNoticeDismiss }: LoginDialogProps) {
   const [tab, setTab] = useState<Tab>("login");
+  const [registrationNotice, setRegistrationNotice] = useState("");
 
   const close = useCallback(() => {
     setTab("login");
     onClose();
   }, [onClose]);
   const dismiss = useCallback(() => {
-  if (expired) return;
-  close();
-}, [close, expired]);
+    if (expired) return;
+    close();
+  }, [close, expired]);
+  const handleLoginSuccess = useCallback(() => {
+    onNoticeDismiss?.();
+    close();
+  }, [close, onNoticeDismiss]);
 
   return (
     <Dialog.Root open={open} onOpenChange={(nextOpen: boolean) => { if (!nextOpen) dismiss(); }}>
@@ -53,10 +61,11 @@ export function LoginDialog({ open, expired = false, onClose, onAuthenticate }: 
   </p>
 )}
 
+          {tab === "login" && (notice || registrationNotice) && <p className="login-dialog-notice" role="status">{notice || registrationNotice}</p>}
           {tab === "login" ? (
-            <LoginForm onAuthenticate={onAuthenticate} onSuccess={close} onSwitchToRegister={() => setTab("register")} />
+            <LoginForm onAuthenticate={onAuthenticate} onSubmitAttempt={() => setRegistrationNotice("")} onSuccess={handleLoginSuccess} onSwitchToRegister={() => { onNoticeDismiss?.(); setRegistrationNotice(""); setTab("register"); }} />
           ) : (
-            <RegisterForm onSwitchToLogin={() => setTab("login")} />
+            <RegisterForm onSwitchToLogin={() => { onNoticeDismiss?.(); setRegistrationNotice(""); setTab("login"); }} onSuccess={() => { onNoticeDismiss?.(); setRegistrationNotice("注册成功，请使用邮箱登录"); setTab("login"); }} />
           )}
         </Dialog.Content>
       </Dialog.Portal>
@@ -70,10 +79,12 @@ export function LoginDialog({ open, expired = false, onClose, onAuthenticate }: 
 
 function LoginForm({
   onAuthenticate,
+  onSubmitAttempt,
   onSuccess,
   onSwitchToRegister,
 }: {
   onAuthenticate: (username: string, password: string) => Promise<void>;
+  onSubmitAttempt: () => void;
   onSuccess: () => void;
   onSwitchToRegister: () => void;
 }) {
@@ -91,6 +102,7 @@ function LoginForm({
       setError("请先阅读并同意用户协议和隐私政策");
       return;
     }
+    onSubmitAttempt();
     setSubmitting(true);
     setError("");
     try {
@@ -107,14 +119,14 @@ function LoginForm({
     <form onSubmit={(event) => void submit(event)}>
       <Dialog.Title>登录 Nova</Dialog.Title>
       <label>
-        <span>邮箱</span>
+        <span>账号（邮箱或学号）</span>
         <input
           autoComplete="username"
           autoFocus
           value={username}
           onChange={(event) => setUsername(event.target.value)}
           disabled={submitting}
-          placeholder="请输入邮箱"
+          placeholder="请输入邮箱、账号或学号"
           maxLength={254}
           required
         />
@@ -168,8 +180,10 @@ function LoginForm({
 
 function RegisterForm({
   onSwitchToLogin,
+  onSuccess,
 }: {
   onSwitchToLogin: () => void;
+  onSuccess?: () => void;
 }) {
   const [email, setEmail] = useState("");
   const [emailCode, setEmailCode] = useState("");
@@ -189,6 +203,7 @@ function RegisterForm({
   const [regCaptchaImage, setRegCaptchaImage] = useState("");
   const [regCaptchaCode, setRegCaptchaCode] = useState("");
   const [emailSent, setEmailSent] = useState(false);
+  const [emailNotice, setEmailNotice] = useState("");
   const [hasAgreed, setHasAgreed] = useState(false);
   const [legalDocument, setLegalDocument] = useState<LegalDocumentKind | null>(null);
   const captchaRequestVersion = useRef({ email: 0, reg: 0 });
@@ -232,6 +247,7 @@ function RegisterForm({
     setEmail(value);
     setError("");
     setEmailSent(false);
+    setEmailNotice("");
     setEmailCode("");
     setRegCaptchaId("");
     setRegCaptchaImage("");
@@ -249,8 +265,9 @@ function RegisterForm({
     setEmailSending(true);
     setError("");
     try {
-      await api.sendEmailCode(email.trim(), emailCaptchaId, emailCaptchaCode.trim());
-      setEmailCooldown(60);
+      const sent = await api.sendEmailCode(email.trim(), emailCaptchaId, emailCaptchaCode.trim());
+      setEmailCooldown(sent?.resend_after ?? 60);
+      setEmailNotice(emailCodeNotice(sent?.expires_in));
       setEmailSent(true);
       // Keep emailCaptchaCode value (don't clear it) - user may need to see what they entered
       // Load registration CAPTCHA for the next step
@@ -294,7 +311,8 @@ function RegisterForm({
         captcha_code: regCaptchaCode.trim(),
       });
       // Registration successful — switch to login tab
-      onSwitchToLogin();
+      if (onSuccess) onSuccess();
+      else onSwitchToLogin();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "注册失败，请稍后重试。");
       // Refresh registration captcha on failure
@@ -387,6 +405,7 @@ function RegisterForm({
             {emailSending ? "发送中..." : emailCooldown > 0 ? `${emailCooldown}s` : "发送验证码"}
           </button>
         </div>
+        {emailSent && <p role="status" style={{ fontSize: 12, color: "var(--text-secondary, #6b7280)" }}>{emailNotice}</p>}
       </label>
       <label>
         <span>密码</span>

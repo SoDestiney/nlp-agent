@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from dotenv import dotenv_values
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.runtime_config import load_runtime_config
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
     NLP_AGENT_AUTH_IDLE_TIMEOUT_S: int = 900
     NLP_AGENT_AUTH_MAX_LOGIN_ATTEMPTS: int = 5
     NLP_AGENT_AUTH_RATE_WINDOW_S: int = 300
+    NLP_AGENT_AUTH_MAX_IP_LOGIN_ATTEMPTS: int = 100
+    NLP_AGENT_AUTH_IP_RATE_WINDOW_S: int | None = None
     NLP_AGENT_EMAIL_DEVELOPMENT_MODE: bool = False
     NLP_AGENT_EMAIL_PROVIDER: str = "smtp"
     NLP_AGENT_TENCENT_SES_SECRET_ID: str = ""
@@ -42,6 +45,9 @@ class Settings(BaseSettings):
     NLP_AGENT_AUDIT_SUCCESSFUL_READS: bool = False
     NLP_AGENT_WEB_HOST: str = ""
     NLP_AGENT_WEB_PORT: int = 0
+    # Immutable deployment path selected by the release workflow. The previous
+    # runtime YAML remains intact so an older container can still roll back.
+    NLP_AGENT_WEB_STATIC_DIR: str = ""
     NLP_AGENT_WEB_ALLOWED_HOSTS: str = ""
     NLP_AGENT_WEB_ALLOWED_ORIGINS: str = ""
     NLP_AGENT_MONITOR_HOST: str = ""
@@ -64,9 +70,18 @@ class Settings(BaseSettings):
     NLP_AGENT_QUOTA_ENFORCEMENT_PERCENT: int | None = None
     NLP_AGENT_QUOTA_ENFORCEMENT_USERS: str = ""
     NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES: str = ""
-    NLP_AGENT_DB_POOL_SIZE: int = 10
-    NLP_AGENT_DB_MAX_OVERFLOW: int = 20
+    NLP_AGENT_DB_POOL_SIZE: int = 5
+    NLP_AGENT_DB_MAX_OVERFLOW: int = 5
+    NLP_AGENT_DB_SYNC_POOL_SIZE: int = 5
+    NLP_AGENT_DB_SYNC_MAX_OVERFLOW: int = 5
+    NLP_AGENT_DB_POOL_TIMEOUT_S: int = 5
     NLP_AGENT_DB_POOL_RECYCLE_S: int = 1800
+    NLP_AGENT_WORKER_CONCURRENCY: int = 4
+    NLP_AGENT_WORKER_SHUTDOWN_GRACE_S: float = 30.0
+    NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S: float = 5.0
+    NLP_AGENT_WORKER_HEARTBEAT_TTL_S: int = 15
+    NLP_AGENT_TURN_CAPACITY_RECONCILE_INTERVAL_S: int = 60
+    NLP_AGENT_TEST_MODEL_QUOTA_TOKENS: int | None = Field(default=None, gt=0)
     NLP_AGENT_DB_CONNECT_TIMEOUT_S: int = 5
     NLP_AGENT_DB_STATEMENT_TIMEOUT_S: int = 30
     # Timezone used to bucket teacher-analytics hour/weekday and peak-hour
@@ -77,6 +92,8 @@ class Settings(BaseSettings):
     NLP_AGENT_SANDBOX_RUNTIME_MODE: str = "disabled"
     NLP_AGENT_SANDBOX_RUNTIME_BACKEND: str = "runsc"
     NLP_AGENT_SANDBOX_DOCKER_IMAGE_DIGEST: str = ""
+    NLP_AGENT_SANDBOX_DOCKER_MEMORY_MB: int = Field(default=768, ge=256)
+    NLP_AGENT_SANDBOX_DOCKER_CPUS: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     NLP_AGENT_SANDBOX_NAMESPACE: str = "local"
     NLP_AGENT_SANDBOX_HOST_LOCK_FILE: str = ""
     NLP_AGENT_SANDBOX_KUBERNETES_CLIENT_FACTORY: str = ""
@@ -209,6 +226,10 @@ class Settings(BaseSettings):
             config["quota_enforcement_users"] = self.NLP_AGENT_QUOTA_ENFORCEMENT_USERS
         if self.NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES.strip():
             config["quota_enforcement_workspaces"] = self.NLP_AGENT_QUOTA_ENFORCEMENT_WORKSPACES
+        config["worker_concurrency"] = self.NLP_AGENT_WORKER_CONCURRENCY
+        config["worker_shutdown_grace_s"] = self.NLP_AGENT_WORKER_SHUTDOWN_GRACE_S
+        config["worker_heartbeat_interval_s"] = self.NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S
+        config["worker_heartbeat_ttl_s"] = self.NLP_AGENT_WORKER_HEARTBEAT_TTL_S
         return config
 
     @property
@@ -237,6 +258,9 @@ class Settings(BaseSettings):
                 "url": self.NLP_AGENT_DATABASE_URL.strip(),
                 "pool_size": self.NLP_AGENT_DB_POOL_SIZE,
                 "max_overflow": self.NLP_AGENT_DB_MAX_OVERFLOW,
+                "sync_pool_size": self.NLP_AGENT_DB_SYNC_POOL_SIZE,
+                "sync_max_overflow": self.NLP_AGENT_DB_SYNC_MAX_OVERFLOW,
+                "pool_timeout_s": self.NLP_AGENT_DB_POOL_TIMEOUT_S,
                 "pool_recycle_s": self.NLP_AGENT_DB_POOL_RECYCLE_S,
                 "connect_timeout_s": self.NLP_AGENT_DB_CONNECT_TIMEOUT_S,
                 "statement_timeout_s": self.NLP_AGENT_DB_STATEMENT_TIMEOUT_S,
@@ -247,6 +271,8 @@ class Settings(BaseSettings):
     @property
     def web_runtime(self) -> dict:
         config = dict(self._config.get("web", {}))
+        if self.NLP_AGENT_WEB_STATIC_DIR.strip():
+            config["static_dir"] = self.NLP_AGENT_WEB_STATIC_DIR.strip()
         if self.NLP_AGENT_WEB_SECRET:
             config["auth_secret"] = self.NLP_AGENT_WEB_SECRET
         if self.NLP_AGENT_AUTH_USERNAME:

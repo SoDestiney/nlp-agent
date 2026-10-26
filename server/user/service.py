@@ -27,9 +27,11 @@ from server.infrastructure.mysql.models import (
     OutboxMessageModel,
 )
 from server.auth import code_store
+from .identity import generate_public_identity_id, validate_public_identity_id
 
 from .schemas import UserCreate, UserRegister, UserUpdate
 from .email import normalize_email
+from .phone import normalize_phone_number
 
 
 class UserServiceError(Exception):
@@ -44,12 +46,20 @@ class UserAlreadyExistsError(UserServiceError):
     """Raised when attempting to create a duplicate user."""
 
 
+class IdentityIdAlreadyExistsError(UserAlreadyExistsError):
+    """Raised when a public identity ID is already assigned to another user."""
+
+
 class EmailAlreadyUsedError(UserServiceError):
     """Raised when an email address is already registered."""
 
 
 class InvalidEmailCodeError(UserServiceError):
     """Raised when an email verification code is invalid or expired."""
+
+
+class InvalidSmsCodeError(UserServiceError):
+    """Raised when an SMS verification code is invalid or expired."""
 
 
 class InvalidCaptchaError(UserServiceError):
@@ -107,6 +117,8 @@ class UserService:
         data: UserCreate,
         *,
         actor_user_id: Optional[str] = None,
+        initial_role_code: str = DEFAULT_USER_ROLE,
+        phone_number: str | None = None,
     ) -> UserModel:
         """Create a new user with password hashing.
 
@@ -114,11 +126,13 @@ class UserService:
         and assigns them as the owner.
         """
         # Check for existing user
-        existing = await self.session.scalar(
-            select(UserModel.id).where(
-                UserModel.username_lower == data.username.casefold()
+        normalized_phone = normalize_phone_number(phone_number) if phone_number else None
+        duplicate_filters = [UserModel.username_lower == data.username.casefold()]
+        if normalized_phone:
+            duplicate_filters.append(
+                UserModel.phone_number_normalized == normalized_phone
             )
-        )
+        existing = await self.session.scalar(select(UserModel.id).where(or_(*duplicate_filters)))
         if existing:
             raise UserAlreadyExistsError(
                 "User with this username already exists"
@@ -130,9 +144,12 @@ class UserService:
         # Create user
         user = UserModel(
             id=str(uuid.uuid4()),
+            identity_id=generate_public_identity_id(),
             username=data.username,
             password_hash=password_hash,
             display_name=data.display_name,
+            phone_number=normalized_phone,
+            phone_number_normalized=normalized_phone,
             status="active",
             authorization_version=1,
         )
@@ -169,14 +186,16 @@ class UserService:
         # first transaction.  The role catalog is seeded by the RBAC migration;
         # failing closed here prevents an account that can authenticate but has
         # no authorization semantics.
-        guest_role = await self.session.scalar(
+        initial_role = await self.session.scalar(
             select(RoleModel).where(
-                RoleModel.code == DEFAULT_USER_ROLE,
+                RoleModel.code == initial_role_code,
                 RoleModel.status == "active",
             )
         )
-        if guest_role is None:
-            raise UserServiceError("default guest role is not available")
+        if initial_role is None:
+            raise UserServiceError(
+                f"initial role {initial_role_code!r} is not available"
+            )
         assigned_by = None
         if actor_user_id is not None:
             assigned_by = await self.session.scalar(
@@ -185,7 +204,7 @@ class UserService:
         self.session.add(
             UserRoleModel(
                 user_id=user.id,
-                role_id=guest_role.id,
+                role_id=initial_role.id,
                 assigned_by_user_id=assigned_by,
             )
         )
@@ -256,6 +275,7 @@ class UserService:
             like_filter = or_(
                 UserModel.username.ilike(pattern, escape="\\"),
                 UserModel.display_name.ilike(pattern, escape="\\"),
+                UserModel.identity_id.ilike(pattern, escape="\\"),
             )
             query = query.where(like_filter)
             count_query = count_query.where(like_filter)
@@ -302,6 +322,35 @@ class UserService:
         user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         await self.session.flush()
         return user
+
+    async def update_user_identity_id(
+        self,
+        user_id: str,
+        identity_id: str,
+    ) -> tuple[UserModel, str]:
+        """Update a user's public identity ID after checking uniqueness."""
+        normalized = validate_public_identity_id(identity_id)
+        user = await self.get_user(user_id)
+        previous_identity_id = user.identity_id
+        if normalized == previous_identity_id:
+            return user, previous_identity_id
+
+        duplicate = await self.session.scalar(
+            select(UserModel.id).where(
+                UserModel.identity_id == normalized,
+                UserModel.id != user_id,
+            )
+        )
+        if duplicate is not None:
+            raise IdentityIdAlreadyExistsError("该身份 ID 已被其他账号占用")
+
+        user.identity_id = normalized
+        user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            await self.session.flush()
+        except IntegrityError as exc:
+            raise IdentityIdAlreadyExistsError("该身份 ID 已被其他账号占用") from exc
+        return user, previous_identity_id
 
     async def _revoke_user_sessions(self, user_id: str) -> None:
         """Revoke all active database sessions for a user."""
@@ -569,49 +618,69 @@ class UserService:
         self,
         data: UserRegister,
     ) -> UserModel:
-        """Register an email account within the caller's transaction.
+        """Register a verified phone or email account as a guest."""
+        if data.phone_number is not None:
+            phone = data.phone_number.strip()
+            if not await code_store.consume_code(
+                self.session,
+                kind="captcha",
+                subject=data.captcha_id,
+                code=data.captcha_code,
+            ):
+                raise InvalidCaptchaError("Invalid or expired CAPTCHA")
+            if not await code_store.consume_code(
+                self.session, kind="sms", subject=phone, code=data.sms_code or ""
+            ):
+                raise InvalidSmsCodeError("Invalid or expired verification code")
 
-        This is the sole registration entry point.  The web controller only
-        maps service errors to HTTP responses; all verification, identity
-        normalization, account provisioning, and default-role policy live
-        here.
-        """
-        email = normalize_email(data.email)
-        username = f"user{uuid.uuid4().hex[:12]}"
-
-        # Consume both one-time credentials in the same request transaction.
-        if not await code_store.consume_code(
-            self.session,
-            kind="captcha",
-            subject=data.captcha_id,
-            code=data.captcha_code,
-        ):
-            raise InvalidCaptchaError("Invalid or expired CAPTCHA")
-        if not await code_store.consume_code(
-            self.session, kind="email", subject=email, code=data.email_code
-        ):
-            raise InvalidEmailCodeError("Invalid or expired verification code")
-
-        # The normalized email column is the durable identity key.
-        existing = await self.session.scalar(
-            select(UserModel.id).where(
-                (UserModel.email_normalized == email)
-                | (UserModel.username_lower == username.casefold())
+            phone_digits = "".join(character for character in phone if character.isdigit())
+            existing = await self.session.scalar(
+                select(UserModel.id).where(
+                    (UserModel.username_lower == phone_digits.casefold())
+                    | (UserModel.phone_number_normalized == phone)
+                )
             )
-        )
-        if existing:
-            raise EmailAlreadyUsedError("This email is already registered")
+            if existing:
+                raise UserAlreadyExistsError("This phone number is already registered")
 
-        display_name = (data.display_name or "").strip() or email.split("@")[0]
-        user_create = UserCreate(
-            username=username,
-            display_name=display_name,
-            password=data.password,
-        )
-        user = await self.create_user(user_create)
-        user.email = email
-        user.email_normalized = email
-        user.registration_source = "email"
+            username = phone_digits
+            display_name = (data.display_name or "").strip() or f"User {phone_digits[-4:]}"
+            user = await self.create_user(
+                UserCreate(username=username, display_name=display_name, password=data.password),
+                initial_role_code=DEFAULT_USER_ROLE,
+                phone_number=phone,
+            )
+            user.registration_source = "phone"
+        else:
+            email = normalize_email(data.email or "")
+            username = f"user{uuid.uuid4().hex[:12]}"
+            if not await code_store.consume_code(
+                self.session,
+                kind="captcha",
+                subject=data.captcha_id,
+                code=data.captcha_code,
+            ):
+                raise InvalidCaptchaError("Invalid or expired CAPTCHA")
+            if not await code_store.consume_code(
+                self.session, kind="email", subject=email, code=data.email_code or ""
+            ):
+                raise InvalidEmailCodeError("Invalid or expired verification code")
+
+            existing = await self.session.scalar(
+                select(UserModel.id).where(UserModel.email_normalized == email)
+            )
+            if existing:
+                raise EmailAlreadyUsedError("This email is already registered")
+
+            display_name = (data.display_name or "").strip() or email.split("@")[0]
+            user = await self.create_user(
+                UserCreate(username=username, display_name=display_name, password=data.password),
+                initial_role_code=DEFAULT_USER_ROLE,
+            )
+            user.email = email
+            user.email_normalized = email
+            user.registration_source = "email"
+
         await self.session.flush()
         await self.session.refresh(user)
         return user
@@ -625,11 +694,18 @@ class UserService:
 def generate_email_code() -> str:
     """Generate a 6-digit verification code.
 
-    This is a pure random generator: persistence, the 120s expiry, single-use
+    This is a pure random generator: persistence, the policy expiry, single-use
     semantics and server-side send-rate limits all live in
     :mod:`server.auth.code_store` (shared ``nlp_auth_codes`` table), so codes
     survive multi-instance deployments.
     """
+    import secrets
+
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def generate_sms_code() -> str:
+    """Generate a cryptographically random six-digit SMS verification code."""
     import secrets
 
     return f"{secrets.randbelow(1_000_000):06d}"

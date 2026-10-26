@@ -16,6 +16,7 @@ import { useTurnHistory } from "../internal/turn-history";
 
 export function useStudentWorkspace() {
   const globalAuth = useOptionalAuth();
+  const refreshAuthSession = globalAuth?.refreshSession;
   const {
     preferences,
     preferencesRef,
@@ -142,8 +143,16 @@ export function useStudentWorkspace() {
 
   useEffect(() => {
     if (bootStatus !== "ready") return;
-
-    const socket = new StudentSocket(handleEvent, setSocketStatus);
+    const socket = new StudentSocket(
+      handleEvent,
+      setSocketStatus,
+      undefined,
+      async () => {
+        await refreshAuthSession?.();
+        const sessionId = activeSessionRef.current;
+        if (sessionId) await loadTurns(sessionId);
+      },
+    );
     socketRef.current = socket;
     socket.setSession(activeSessionRef.current);
     socket.connect();
@@ -152,7 +161,27 @@ export function useStudentWorkspace() {
       socket.close();
       socketRef.current = null;
     };
-  }, [activeSessionRef, bootStatus, handleEvent]);
+  }, [activeSessionRef, bootStatus, refreshAuthSession, handleEvent, loadTurns]);
+
+  useEffect(() => {
+    // AuthProvider is the single global 401 boundary. If a request made by
+    // this workspace discovers a revoked/changed session, stop the socket and
+    // return the workspace to its unauthenticated recovery state as well.
+    if (globalAuth?.isAuthenticated !== false || !authSession?.user_id) return;
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      socketRef.current?.close();
+      socketRef.current = null;
+      setAuthSession(null);
+      setSessions([]);
+      setActiveSessionId(null);
+      setMessages([]);
+      setModelProfiles({});
+      setBootStatus("unauthenticated");
+    });
+    return () => { active = false; };
+  }, [authSession?.user_id, globalAuth?.isAuthenticated, setActiveSessionId, setSessions]);
 
   useEffect(() => {
     loadGenerationRef.current += 1;

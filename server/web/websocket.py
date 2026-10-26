@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 import inspect
 import json
 from collections import defaultdict
@@ -15,7 +16,7 @@ from pydantic import ValidationError
 
 from core.identity import AuthenticatedPrincipal
 from core.rbac import Permission, authorization_service
-from gateway.contracts import GatewayEventType, InjectMessageRequest, SubmitTurnRequest
+from gateway.contracts import AdmissionLimitError, GatewayEventType, InjectMessageRequest, SubmitTurnRequest
 from gateway.core import BackendGateway
 from gateway.events import GatewayEventStreamInterrupted, GatewayEventSubscription
 from server.web.auth import (
@@ -142,6 +143,29 @@ class WebSocketHub:
         if targets:
             await asyncio.gather(*(item.close(code=code, reason=reason) for item in targets), return_exceptions=True)
 
+    async def revalidate_user(self, user_id: str) -> None:
+        """Fence stale sockets without closing a valid post-change reconnect.
+
+        Outbox/PubSub notifications can arrive late or more than once. The
+        database session and refreshed principal determine whether each socket
+        is still valid, rather than the delivery time of the notification.
+        """
+        async def check(connection: WebSocketConnection) -> None:
+            try:
+                async with asyncio.timeout(5):
+                    await connection.require_active_session(touch=False)
+                    await connection.refresh_authorization()
+            except (AuthenticationError, PermissionError):
+                await connection.close(code=4403, reason="authorization changed")
+            except Exception:
+                # A failed authoritative check must not retain a socket with
+                # potentially revoked access, or stop the PubSub listener.
+                await connection.close(code=1013, reason="authorization check unavailable")
+
+        targets = [item for item in tuple(self._connections) if item.principal.user_id == user_id]
+        if targets:
+            await asyncio.gather(*(check(item) for item in targets), return_exceptions=True)
+
     async def close(self) -> None:
         connections = list(self._connections)
         self._connections.clear()
@@ -202,6 +226,7 @@ class WebSocketConnection:
         self._session_guard_task: asyncio.Task[None] | None = None
         self._closed_event = asyncio.Event()
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self._sender_task is None:
@@ -453,12 +478,21 @@ class WebSocketConnection:
             pass
 
     async def _terminate(self, *, code: int, reason: str) -> None:
-        if self._closed:
-            return
+        if self._close_task is None:
+            self._closed = True
+            initiator = asyncio.current_task()
+            self._close_task = asyncio.create_task(
+                self._finish_close(code=code, reason=reason, initiator=initiator),
+                name=f"websocket-close:{self.principal.user_id}",
+            )
+        # A disconnected browser may cancel the endpoint while it is closing.
+        # Keep cleanup owned by this connection; concurrent closes join it.
+        await asyncio.shield(self._close_task)
+
+    async def _finish_close(self, *, code: int, reason: str, initiator: asyncio.Task | None) -> None:
         self._closed = True
-        self._closed_event.set()
         try:
-            current = asyncio.current_task()
+            current = initiator
             subscriptions = list(self._subscriptions.values())
             tasks = list(self._subscription_tasks.values())
             self._subscriptions.clear()
@@ -515,6 +549,7 @@ class WebSocketConnection:
                 pass
         finally:
             self._fail_queued_frames()
+            self._closed_event.set()
 
     async def close(self, *, code: int = 1000, reason: str = "connection closed") -> None:
         await self._terminate(code=code, reason=reason)
@@ -522,6 +557,13 @@ class WebSocketConnection:
 
 def _command_error(error: Exception) -> tuple[str, str, dict[str, Any]]:
     name = type(error).__name__
+    if isinstance(error, AdmissionLimitError):
+        messages = {
+            AdmissionLimitError.QUEUE_CAPACITY_EXCEEDED: "当前课堂排队人数较多，请稍后重试。",
+            AdmissionLimitError.USER_ACTIVE_LIMIT_REACHED: "你的进行中任务已达上限，请等待已有任务完成。",
+            AdmissionLimitError.MODEL_QUOTA_EXCEEDED: "模型额度不足，暂时无法提交任务。",
+        }
+        return error.code, messages[error.code]
     if isinstance(error, StorageQuotaExceeded):
         return "storage_quota_exceeded", "账户通用存储空间已达到配额，请清理会话、记忆或图片后重试", {}
     if isinstance(error, QuotaRejectedError):
@@ -589,6 +631,8 @@ async def _dispatch_command(
                     "command": command.type,
                     "status": accepted.status.value,
                     "duplicate": accepted.duplicate,
+                    "queue_position": accepted.queue_position,
+                    "waited_s": accepted.waited_s,
                 },
             )
         )
@@ -747,40 +791,29 @@ async def websocket_endpoint(
     if not hub.try_add(connection):
         await websocket.close(code=4429, reason="connection limit reached")
         return
-    await websocket.accept()
-    connection.start()
-    ready_sent = await connection.send(
-        control_event(
-            "connection.ready",
-            payload={
+    try:
+        await websocket.accept()
+        connection.start()
+        ready_sent = await connection.send(
+            control_event("connection.ready", payload={
                 "user_id": principal.user_id,
                 "workspace_ids": sorted(principal.workspace_ids),
                 "protocol_version": "1",
-            },
-        ),
-        wait=True,
-    )
-    if not ready_sent:
-        hub.discard(connection)
-        return
-    try:
+            }), wait=True,
+        )
+        if not ready_sent:
+            return
         await _receive_commands(websocket, connection, max_message_bytes)
+    except asyncio.CancelledError:
+        # Cancellation of the ASGI transport is a disconnect, not a Turn
+        # cancellation. This endpoint owns only its connection resources.
+        pass
     finally:
         hub.discard(connection)
-        try:
+        # AnyIO level cancellation repeatedly cancels checkpoints unless the
+        # cleanup scope is shielded; asyncio.shield alone cannot protect it.
+        with anyio.CancelScope(shield=True):
             await connection.close()
-        except asyncio.CancelledError:
-            # Re-raise cancellation but ensure basic cleanup happens
-            # The connection will be marked as closed in all cases
-            if not connection._closed:
-                connection._closed = True
-                connection._closed_event.set()
-            raise
-        except Exception:
-            # Other exceptions during close are logged but not propagated
-            if not connection._closed:
-                connection._closed = True
-                connection._closed_event.set()
 
 
 async def _receive_commands(
@@ -805,7 +838,21 @@ async def _receive_commands(
             except AuthenticationError:
                 await connection.close(code=4401, reason="authentication expired")
                 return
-            except (json.JSONDecodeError, ValidationError, ValueError, PermissionError, RuntimeError, LookupError, FileNotFoundError, StorageQuotaExceeded, QuotaRejectedError) as error:
+            except PermissionError as error:
+                if str(error) == "authorization changed; reconnect required":
+                    await connection.close(code=4403, reason="authorization changed")
+                    return
+                code, message, details = _command_error(error)
+                session_id = command.payload.get("session_id") if command is not None else None
+                await connection.send(
+                    control_event(
+                        "command.error",
+                        request_id=request_id,
+                        session_id=session_id if isinstance(session_id, str) else None,
+                        payload={"code": code, "message": message},
+                    )
+                )
+            except (json.JSONDecodeError, ValidationError, ValueError, RuntimeError, LookupError, FileNotFoundError, StorageQuotaExceeded, QuotaRejectedError) as error:
                 code, message, details = _command_error(error)
                 session_id = command.payload.get("session_id") if command is not None else None
                 await connection.send(

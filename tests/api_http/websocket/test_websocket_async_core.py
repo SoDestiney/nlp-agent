@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from typing import Any
 
 import httpx
@@ -11,7 +12,8 @@ import pytest
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from ..support.chat import submit_turn
-from ..support.resources import create_session
+from ..support.auth import session_id_for_client
+from ..support.resources import create_classroom, create_session, create_user, create_workspace
 from ..support.websocket import (
     authenticated_websocket,
     command,
@@ -20,6 +22,31 @@ from ..support.websocket import (
 
 
 pytestmark = pytest.mark.api_async_core
+
+
+def test_established_websocket_idle_expiry_revokes_session_before_http_check(
+    authenticated_client, mysql_probe, web_base_url, api_http_environment,
+) -> None:
+    session_id = session_id_for_client(authenticated_client, mysql_probe)
+
+    async def scenario() -> None:
+        async with authenticated_websocket(authenticated_client, base_url=web_base_url,
+                                          origin=api_http_environment.web_origin) as websocket:
+            assert decode(await websocket.recv())["type"] == "connection.ready"
+            mysql_probe.execute(
+                "UPDATE nlp_sessions SET last_seen_at=UTC_TIMESTAMP(6)-INTERVAL 1 DAY WHERE id=:session_id",
+                session_id=session_id,
+            )
+            with pytest.raises(ConnectionClosed) as closed:
+                await websocket.send(command("ping", "idle-ping", {}))
+                await asyncio.wait_for(websocket.recv(), timeout=10)
+            assert closed.value.rcvd is not None and closed.value.rcvd.code == 4401
+
+    asyncio.run(scenario())
+    # Check the committed state before an HTTP request can expire the row itself.
+    assert mysql_probe.scalar("SELECT revoked_at FROM nlp_sessions WHERE id=:session_id",
+                              session_id=session_id) is not None
+    assert authenticated_client.get("/api/v1/auth/session").status_code == 401
 
 
 async def _receive_until(
@@ -382,5 +409,88 @@ def test_websocket_hides_foreign_session_and_reacts_to_session_revoke(
                 assert closed.rcvd.code == 4401
             else:
                 raise AssertionError("revoked WebSocket session remained usable")
+
+    asyncio.run(scenario())
+
+
+def test_websocket_refreshes_guest_approval_and_reconnects_as_student(
+    authenticated_client_for,
+    developer_user,
+    teacher_user,
+    web_base_url: str,
+    api_http_environment,
+    redis_probe,
+) -> None:
+    developer_client = authenticated_client_for(developer_user)
+    guest = create_user(developer_client, role="guest", prefix="t06wsguest")
+    guest_client = authenticated_client_for(guest)
+    teacher_client = authenticated_client_for(teacher_user)
+    workspace = create_workspace(teacher_client, name="T06 WebSocket Approval Workspace")
+    classroom = create_classroom(
+        teacher_client,
+        workspace_id=workspace["id"],
+        name="T06 WebSocket Approval Classroom",
+    )
+    code = teacher_client.get(f"/api/v1/classrooms/{classroom['id']}/join-code").json()["join_code"]
+    submitted = guest_client.post(
+        "/api/v1/classrooms/join-requests",
+        json={"join_code": code},
+    )
+    assert submitted.status_code == 201, submitted.text
+    request_id = submitted.json()["id"]
+
+    async def scenario() -> None:
+        async with authenticated_websocket(
+            guest_client,
+            base_url=web_base_url,
+            origin=api_http_environment.web_origin,
+        ) as websocket:
+            assert decode(await asyncio.wait_for(websocket.recv(), 5))["type"] == "connection.ready"
+            approved = await asyncio.to_thread(
+                teacher_client.post,
+                f"/api/v1/classrooms/{classroom['id']}/join-requests/{request_id}/approve",
+                json={},
+            )
+            assert approved.status_code == 200, approved.text
+            await websocket.send(command("ping", "after-approval", {"nonce": "guest-to-student"}))
+            with pytest.raises(ConnectionClosed) as closed:
+                await asyncio.wait_for(websocket.recv(), 5)
+            assert closed.value.rcvd is not None
+            assert closed.value.rcvd.code == 4403
+
+        session = guest_client.get("/api/v1/auth/session")
+        assert session.status_code == 200, session.text
+        assert session.json()["roles"] == ["student"]
+        guest_client.headers["X-CSRF-Token"] = session.json()["csrf_token"]
+
+        async with authenticated_websocket(
+            guest_client,
+            base_url=web_base_url,
+            origin=api_http_environment.web_origin,
+        ) as resumed:
+            assert decode(await asyncio.wait_for(resumed.recv(), 5))["type"] == "connection.ready"
+            await resumed.send(command("ping", "after-reconnect", {"nonce": "student"}))
+            frames = await _receive_until(
+                resumed,
+                lambda frame: frame.get("request_id") == "after-reconnect",
+                timeout_s=5,
+            )
+            assert frames[-1]["type"] == "pong"
+
+            # Simulate delayed/repeated delivery of the already committed
+            # approval notice. A new socket has the current DB authorization
+            # version and must survive; timing the relay should not log it out.
+            for index in range(3):
+                listeners = await asyncio.to_thread(
+                    redis_probe.client.publish, "nlp-agent:authorization",
+                    json.dumps({"user_id": guest.user_id, "reason": "classroom_membership_changed"}),
+                )
+                assert listeners > 0
+                await asyncio.sleep(0.15)
+                identifier = f"after-delayed-notice-{index}"
+                await resumed.send(command("ping", identifier, {"nonce": "still-student"}))
+                frames = await _receive_until(resumed, lambda frame: frame.get("request_id") == identifier, timeout_s=5)
+                assert frames[-1]["type"] == "pong"
+            assert (await asyncio.to_thread(guest_client.get, "/api/v1/auth/session")).status_code == 200
 
     asyncio.run(scenario())

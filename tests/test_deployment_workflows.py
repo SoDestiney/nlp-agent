@@ -17,6 +17,35 @@ WORKFLOW_PATHS = (
 RETRY_HELPER_PATH = ROOT / ".github" / "scripts" / "run-with-transient-registry-retry.sh"
 
 
+def test_test_publish_queues_fallbacks_without_cancelling_live_deployments() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/publish-test-image.yml").read_text(encoding="utf-8"))
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    assert workflow["concurrency"]["queue"] == "max"
+    assert workflow["concurrency"]["group"] == "nova-test-release"
+    publish = workflow["jobs"]["publish"]
+    steps = publish["steps"]
+    source = next(i for i, step in enumerate(steps) if step.get("id") == "source")
+    for step in steps[source+1:]:
+        assert step["if"] == "steps.source.outputs.current == 'true'"
+    assert "current-release-source.py" in steps[source]["run"]
+    assert "--attach-source-branch" in steps[source]["run"]
+    assert "publish.outputs.current_source == 'true'" in workflow["jobs"]["deploy"]["if"]
+    deploy = next(step for step in workflow["jobs"]["deploy"]["steps"] if "AUTH_DEPLOY_SOURCE_DIR" in step.get("env", {}))
+    assert deploy["run"].index("current-release-source.py") < deploy["run"].index('if [ -z "$DEPLOY_DIR" ]')
+    assert "--attach-source-branch" not in deploy["run"]
+    assert "NLP_AGENT_DEPLOYMENT_ENV=\\\"test\\\"" in deploy["run"]
+    assert "NLP_AGENT_DEPLOYMENT_ENV" not in (ROOT / ".github/workflows/release-prod.yml").read_text(encoding="utf-8")
+
+
+def test_test_worker_proxy_preflight_uses_all_running_ids_not_container_number_one() -> None:
+    workflow = (ROOT / ".github/workflows/publish-test-image.yml").read_text(encoding="utf-8")
+    assert "ps --status running -q nova-worker" in workflow
+    assert "for worker_id in $worker_ids; do" in workflow
+    assert 'if ! docker exec "$worker_id" .venv/bin/python -c' in workflow
+    assert 'if [ -z "$worker_ids" ]; then' in workflow
+    assert "exec -T nova-worker" not in workflow
+
+
 def test_deployment_workflows_update_and_check_worker() -> None:
     for workflow_path in WORKFLOW_PATHS:
         workflow = workflow_path.read_text(encoding="utf-8")
@@ -26,11 +55,7 @@ def test_deployment_workflows_update_and_check_worker() -> None:
             "nova-sandbox-manager nginx"
         )
         assert f"pull {pull_services}" in workflow or f"pull --quiet {pull_services}" in workflow
-        assert (
-            "up -d --force-recreate --no-build --remove-orphans "
-            "nova-migrate nova-web nova-worker nova-monitor nova-sandbox-manager nginx"
-        ) in workflow
-        assert "if ! docker compose" in workflow
+        assert 'if ! python3 "$AUTH_DEPLOY_SOURCE_DIR/.github/scripts/update-application-services.py"' in workflow
         assert "logs --no-color --tail=200 nova-migrate" in workflow
         assert (
             "ps --status running --services nova-worker | grep -Fxq \"nova-worker\""
@@ -50,7 +75,7 @@ def test_deployment_workflows_retry_transient_registry_reads() -> None:
         workflow = workflow_path.read_text(encoding="utf-8")
 
         assert (
-            'bash "$GITHUB_WORKSPACE/.github/scripts/'
+            'bash "$AUTH_DEPLOY_SOURCE_DIR/.github/scripts/'
             'run-with-transient-registry-retry.sh"'
         ) in workflow
         assert (
@@ -59,10 +84,27 @@ def test_deployment_workflows_retry_transient_registry_reads() -> None:
         )
         assert (
             "pull --quiet " + "nova-migrate nova-web nova-worker nova-monitor "
-            "nova-sandbox-manager nginx mysql redis"
+            "nova-sandbox-manager nginx"
             in workflow
         )
         assert "export NOVA_PULL_POLICY=never" in workflow
+        assert "nginx mysql redis" not in workflow
+
+
+def test_self_hosted_deploy_checkouts_do_not_replace_shared_live_bind_sources() -> None:
+    paths = []
+    for workflow_path in WORKFLOW_PATHS:
+        workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+        steps = workflow["jobs"]["deploy"]["steps"]
+        checkout = steps[0]["with"]["path"]
+        assert checkout and "/" not in checkout and checkout not in (".", "..")
+        paths.append(checkout)
+        deploy = next(step for step in steps if "AUTH_DEPLOY_SOURCE_DIR" in step.get("env", {}))
+        assert deploy["working-directory"] == checkout
+        assert deploy["env"]["AUTH_DEPLOY_SOURCE_DIR"] == "${{ github.workspace }}/" + checkout
+        assert "$GITHUB_WORKSPACE/.github/scripts/" not in deploy["run"]
+        assert '$AUTH_DEPLOY_SOURCE_DIR/.github/scripts/prepare-auth-release.py' in deploy["run"]
+    assert len(set(paths)) == len(paths)
 
 
 def test_registry_retry_helper_retries_eof_and_preserves_success() -> None:

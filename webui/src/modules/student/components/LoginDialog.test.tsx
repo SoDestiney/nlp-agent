@@ -16,6 +16,7 @@ describe("LoginDialog", () => {
     vi.mocked(api.getCaptcha).mockReset();
     vi.mocked(api.getCaptcha).mockResolvedValue({ captcha_id: "captcha-1", image: "data:image/png;base64,abc" });
     vi.mocked(api.sendEmailCode).mockReset();
+    vi.mocked(api.register).mockReset();
   });
   it("renders without loading a decorative logo image", () => {
     render(<LoginDialog open onClose={vi.fn()} onAuthenticate={vi.fn()} />);
@@ -28,7 +29,7 @@ describe("LoginDialog", () => {
     const close = vi.fn();
     render(<LoginDialog open onClose={close} onAuthenticate={authenticate} />);
 
-    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "nova" } });
+    fireEvent.change(screen.getByLabelText("账号（邮箱或学号）"), { target: { value: "nova" } });
     fireEvent.change(screen.getByLabelText("密码"), { target: { value: "test-password" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "我已阅读并同意用户协议和隐私政策" }));
     fireEvent.click(screen.getByRole("button", { name: "登录并继续" }));
@@ -42,7 +43,7 @@ describe("LoginDialog", () => {
     const close = vi.fn();
     render(<LoginDialog open onClose={close} onAuthenticate={authenticate} />);
 
-    fireEvent.change(screen.getByLabelText("邮箱"), { target: { value: "nova" } });
+    fireEvent.change(screen.getByLabelText("账号（邮箱或学号）"), { target: { value: "nova" } });
     fireEvent.change(screen.getByLabelText("密码"), { target: { value: "wrong" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "我已阅读并同意用户协议和隐私政策" }));
     fireEvent.click(screen.getByRole("button", { name: "登录并继续" }));
@@ -52,26 +53,54 @@ describe("LoginDialog", () => {
   });
 
   it("opens legal documents without leaving the login dialog", () => {
-    render(<LoginDialog open onClose={vi.fn()} onAuthenticate={vi.fn()} />);
+    const close = vi.fn();
+    render(<LoginDialog open onClose={close} onAuthenticate={vi.fn()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "《隐私政策》" }));
-    expect(screen.getByRole("dialog", { name: "隐私政策" })).toBeVisible();
+    const legalDialog = screen.getByRole("dialog", { name: "隐私政策" });
+    expect(legalDialog).toBeVisible();
     expect(screen.getByText(/处理目的/)).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "我已阅读" }));
+    const body = legalDialog.querySelector(".legal-document-body");
+    expect(body).not.toBeNull();
+    const wheelEvent = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 120 });
+    body!.dispatchEvent(wheelEvent);
+    expect(wheelEvent.defaultPrevented).toBe(false);
+
+    const touchMoveEvent = new Event("touchmove", { bubbles: true, cancelable: true });
+    body!.dispatchEvent(touchMoveEvent);
+    expect(touchMoveEvent.defaultPrevented).toBe(false);
+
+    fireEvent.keyDown(legalDialog, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "隐私政策" })).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "《用户协议》" }));
+    const termsDialog = screen.getByRole("dialog", { name: "用户协议" });
+    const termsBody = termsDialog.querySelector(".legal-document-body");
+    const termsWheelEvent = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 120 });
+    termsBody!.dispatchEvent(termsWheelEvent);
+    expect(termsWheelEvent.defaultPrevented).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "我已阅读" }));
+    expect(screen.queryByRole("dialog", { name: "用户协议" })).not.toBeInTheDocument();
   });
 
   it("renders the registration captcha at a readable fixed size", async () => {
+    vi.mocked(api.sendEmailCode).mockResolvedValue({ message: "sent" });
     render(<LoginDialog open onClose={vi.fn()} onAuthenticate={vi.fn()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
 
-    const captcha = await screen.findByAltText("验证码");
+    fireEvent.change(await screen.findByLabelText("邮箱"), { target: { value: "first@example.com" } });
+    fireEvent.change(await screen.findByPlaceholderText("输入图中字符"), { target: { value: "ABCD" } });
+    fireEvent.click(screen.getByRole("button", { name: "发送验证码" }));
+
+    const captcha = await screen.findByAltText("注册验证码");
     expect(captcha).toHaveStyle({ width: "160px", height: "64px" });
   });
 
-  it("locks email while sending and refreshes consumed captcha after an email change", async () => {
+  it("locks the email while sending and refreshes the consumed captcha after a email change", async () => {
     vi.mocked(api.getCaptcha)
       .mockReset()
       .mockResolvedValueOnce({ captcha_id: "email-1", image: "data:image/png;base64,email1" })
@@ -79,7 +108,7 @@ describe("LoginDialog", () => {
       .mockResolvedValueOnce({ captcha_id: "email-2", image: "data:image/png;base64,email2" });
     let finishSending!: () => void;
     vi.mocked(api.sendEmailCode).mockImplementation(() => new Promise((resolve) => {
-      finishSending = () => resolve({ message: "sent" });
+      finishSending = () => resolve({ message: "sent", expires_in: 300, resend_after: 60 });
     }));
     render(<LoginDialog open onClose={vi.fn()} onAuthenticate={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
@@ -143,7 +172,7 @@ it("keeps the expired dialog open when re-login credentials are wrong", async ()
     />,
   );
 
-  fireEvent.change(screen.getByLabelText("邮箱"), {
+  fireEvent.change(screen.getByLabelText("账号（邮箱或学号）"), {
     target: { value: "nova" },
   });
 

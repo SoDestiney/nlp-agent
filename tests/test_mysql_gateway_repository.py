@@ -8,6 +8,7 @@ from sqlalchemy.exc import OperationalError
 from core.learning import ExerciseState, LearningContext, LearningProgress
 from gateway.contracts import GatewayEventType, TurnStatus
 from gateway.contracts import TurnClaimMismatchError
+from gateway.contracts import TurnConflictError
 from gateway.mysql_repository import MySQLGatewayRepository
 
 
@@ -191,12 +192,17 @@ def test_ensure_conversation_rejects_an_identity_collision() -> None:
 
 def test_create_turn_ensures_the_conversation_before_inserting_the_turn() -> None:
     repository = object.__new__(MySQLGatewayRepository)
+    repository._test_model_quota_tokens = None
     engine = MagicMock()
     connection = engine.begin.return_value.__enter__.return_value
+    no_active_turn = MagicMock()
+    no_active_turn.mappings.return_value.first.return_value = None
+    connection.execute.return_value = no_active_turn
     repository._engine = engine
 
     with (
         patch.object(MySQLGatewayRepository, "_ensure_conversation") as ensure,
+        patch.object(MySQLGatewayRepository, "_reserve_model_quota"),
         patch.object(MySQLGatewayRepository, "_row", return_value={"id": "turn-1"}),
         patch.object(MySQLGatewayRepository, "_record", return_value=sentinel.record),
         patch("gateway.mysql_repository.SyncStorageQuota") as quota_type,
@@ -289,6 +295,30 @@ def test_append_event_rejects_a_stale_claim_generation() -> None:
     assert connection.execute.call_count == 1
 
 
+def test_append_event_settles_the_database_measured_size() -> None:
+    repository = object.__new__(MySQLGatewayRepository)
+    transaction = MagicMock()
+    connection = transaction.__enter__.return_value
+    generation, owner, sequence, inserted, measured_size = (MagicMock() for _ in range(5))
+    generation.scalar_one_or_none.return_value = 1
+    owner.scalar_one.return_value = "user-1"
+    sequence.scalar_one.return_value = 7
+    inserted.rowcount = 1
+    measured_size.scalar_one.return_value = 91
+    connection.execute.side_effect = [generation, owner, sequence, inserted, measured_size]
+    repository._runtime_begin = MagicMock(return_value=transaction)
+    with patch("gateway.mysql_repository.SyncStorageQuota") as quota_type:
+        quota = quota_type.return_value
+        quota.reserve.return_value = sentinel.reservation
+        event = repository.append_event(
+            turn_id="turn-1", session_id="session-1", event_type=GatewayEventType.MESSAGE_DELTA,
+            payload={"delta": "fragment"}, expected_claim_generation=1,
+        )
+    quota.finalize.assert_called_once_with(sentinel.reservation, actual_bytes=91, reconcile=False)
+    assert event.sequence == 7
+    assert event.payload == {"delta": "fragment"}
+
+
 def test_create_turn_retries_the_complete_mysql_transaction_after_deadlock() -> None:
     class Transaction:
         def __init__(self, attempt: int, connections: list[MagicMock]) -> None:
@@ -297,6 +327,10 @@ def test_create_turn_retries_the_complete_mysql_transaction_after_deadlock() -> 
 
         def __enter__(self):
             connection = MagicMock(name=f"connection-{self.attempt}")
+            connection.execute.return_value.mappings.return_value.first.return_value = None
+            connection.execute.return_value.mappings.return_value.one.return_value = {
+                "token_limit": None, "reserved_tokens": 0, "used_tokens": 0,
+            }
             self.connections.append(connection)
             return connection
 
@@ -344,3 +378,33 @@ def test_create_turn_retries_the_complete_mysql_transaction_after_deadlock() -> 
     assert engine.begin_count == 2
     assert len(engine.connections) == 2
     assert engine.connections[0] is not engine.connections[1]
+def test_create_turn_rejects_active_conversation_turn_inside_locked_transaction() -> None:
+    repository = object.__new__(MySQLGatewayRepository)
+    engine = MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+    active_turn = MagicMock()
+    active_turn.mappings.return_value.first.return_value = {"id": "active-turn"}
+    connection.execute.return_value = active_turn
+    repository._engine = engine
+
+    with (
+        patch.object(MySQLGatewayRepository, "_ensure_conversation") as ensure,
+        patch.object(MySQLGatewayRepository, "_row", return_value={"id": "new-turn"}),
+        patch.object(MySQLGatewayRepository, "_record", return_value=sentinel.record),
+        patch("gateway.mysql_repository.SyncStorageQuota") as quota_type,
+    ):
+        quota_type.return_value.reserve.return_value = sentinel.reservation
+        with pytest.raises(TurnConflictError, match="active-turn"):
+            repository.create_turn(
+                turn_id="new-turn",
+                session_id="conversation-1",
+                workspace_id="workspace-1",
+                user_id="user-1",
+                input_text="second turn",
+                idempotency_key=None,
+            )
+
+    ensure.assert_called_once()
+    statement = str(connection.execute.call_args.args[0])
+    assert "status IN ('accepted','running')" in statement
+    assert "FOR UPDATE" in statement

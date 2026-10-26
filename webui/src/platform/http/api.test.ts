@@ -1,6 +1,23 @@
-import { api, AUTH_EXPIRED_EVENT, ensureAuth, uploadAttachment } from "./api";
+import { api, AUTH_EXPIRED_EVENT, AUTH_REQUIRED_EVENT, ensureAuth, uploadAttachment } from "./api";
 
 describe("FastAPI client", () => {
+  it("shows an email gateway failure without treating it as an expired login", async () => {
+    const expired = vi.fn();
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      code: "email_gateway_failed", detail: "Email gateway failed to deliver the code",
+    }), { status: 502, headers: { "Content-Type": "application/problem+json" } }));
+    try {
+      await expect(api.sendEmailCode("fixture@example.com", "captcha-1", "ABCD")).rejects.toMatchObject({
+        status: 502, code: "email_gateway_failed", message: "邮件发送失败，请稍后重试；若持续失败，请联系管理员。",
+      });
+      expect(expired).not.toHaveBeenCalled();
+    } finally {
+      fetchMock.mockRestore();
+      window.removeEventListener(AUTH_EXPIRED_EVENT, expired);
+    }
+  });
+
   it("deduplicates concurrent authentication restores", async () => {
     let resolveAuth!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementationOnce(
@@ -160,7 +177,9 @@ it("dispatches auth-expired only once when concurrent requests return 401", asyn
       }), { status: 401, headers: { "Content-Type": "application/json" } }));
 
     const onAuthExpired = vi.fn();
+    const onAuthRequired = vi.fn();
     window.addEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
 
     try {
       await ensureAuth();
@@ -170,8 +189,10 @@ it("dispatches auth-expired only once when concurrent requests return 401", asyn
       });
 
       expect(onAuthExpired).not.toHaveBeenCalled();
+      expect(onAuthRequired).not.toHaveBeenCalled();
     } finally {
       window.removeEventListener(AUTH_EXPIRED_EVENT, onAuthExpired);
+      window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
       fetchMock.mockRestore();
     }
   });
@@ -202,6 +223,21 @@ it("dispatches auth-expired only once when concurrent requests return 401", asyn
     expect(init?.method).toBe("POST");
     expect(init?.body).toBeInstanceOf(FormData);
     expect(new Headers(init?.headers).get("Content-Type")).toBeNull();
+    fetchMock.mockRestore();
+  });
+
+  it("reads a bounded stored-file preview through the authenticated preview endpoint", async () => {
+    const preview = { content: "# lesson", truncated: false, mime_type: "text/markdown", bytes_read: 8 };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify(preview), { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+
+    await expect(api.readStorageFile("file/1", "workspace-1")).resolves.toEqual(preview);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/storage/files/file%2F1/preview?workspace_id=workspace-1",
+      expect.objectContaining({ credentials: "include" }),
+    );
     fetchMock.mockRestore();
   });
 });

@@ -19,11 +19,12 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.mysql import BIGINT, DATETIME, LONGBLOB, MEDIUMTEXT
+from sqlalchemy.dialects.mysql import BIGINT, DATETIME, INTEGER, LONGBLOB, MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, TimestampedModel
 from .table_comments import TABLE_COMMENTS
+from core.public_identity import generate_public_identity_id
 
 # Quota tables share the same Alembic metadata.  Importing them here keeps
 # metadata-based tooling (including foundation checks) aware of every active
@@ -42,9 +43,15 @@ class UserModel(TimestampedModel, Base):
         # 生成列（见下方定义），保证 "Alice" 与 "alice" 在数据库层视为重复，
         # 杜绝同户名大小写不同的重复账号。
         Index("uq_nlp_users_username_lower", "username_lower", unique=True),
+        UniqueConstraint(
+            "phone_number_normalized", name="uq_nlp_users_phone_number_normalized"
+        ),
+        Index("ix_nlp_users_phone_number", "phone_number"),
+        Index("ix_nlp_users_phone_number_normalized", "phone_number_normalized"),
     )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    identity_id: Mapped[str] = mapped_column(String(16, collation="ascii_bin"), unique=True, nullable=False, index=True, default=generate_public_identity_id)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     # 大小写归一化的持久化副本，由数据库自动计算（GENERATED ALWAYS AS (LOWER(username)) STORED）
     username_lower: Mapped[str] = mapped_column(
@@ -71,6 +78,8 @@ class UserModel(TimestampedModel, Base):
     email_normalized: Mapped[str | None] = mapped_column(
         String(254), nullable=True, unique=True, index=True
     )
+    phone_number: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    phone_number_normalized: Mapped[str | None] = mapped_column(String(16), nullable=True)
     registration_source: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="manual"
     )
@@ -246,12 +255,16 @@ class AuthorizationAuditLogModel(Base):
 
 class ClassroomModel(TimestampedModel, Base):
     __tablename__ = "nlp_classrooms"
+    __table_args__ = (
+        UniqueConstraint("join_code", name="uq_nlp_classrooms_join_code"),
+    )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
     workspace_id: Mapped[str] = mapped_column(
         UUID, ForeignKey("nlp_workspaces.id", ondelete="CASCADE"), unique=True, nullable=False
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    join_code: Mapped[str] = mapped_column(String(12), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
 
 
@@ -589,12 +602,144 @@ class TurnModel(TimestampedModel, Base):
     error_message: Mapped[str | None] = mapped_column(String(1000))
     learning_state_json: Mapped[dict | None] = mapped_column(JSON)
     idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    quota_reservation_id: Mapped[str | None] = mapped_column(
+        UUID, ForeignKey("nlp_model_quota_reservations.id", ondelete="SET NULL"), index=True
+    )
     claim_generation: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     claimed_by: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     completed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+
+
+class RuntimeCapacityModel(Base):
+    __tablename__ = "nlp_runtime_capacity"
+    scope_key: Mapped[str] = mapped_column(String(32, collation="ascii_bin"), primary_key=True)
+    queued_count: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    running_count: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    queue_capacity: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, server_default="200")
+    per_user_active_limit: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, server_default="3")
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    updated_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
+    )
+
+
+class TurnUserCapacityModel(Base):
+    __tablename__ = "nlp_turn_user_capacity"
+    user_id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    active_count: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
+    )
+
+
+class ModelQuotaAccountModel(Base):
+    __tablename__ = "nlp_model_quota_accounts"
+    user_id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    quota_tokens: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
+    token_limit: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
+    window_started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    window_ends_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    consumed_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    used_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    unknown_usage_events: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), onupdate=func.utc_timestamp(6), nullable=False
+    )
+
+
+class ModelQuotaReservationModel(Base):
+    __tablename__ = "nlp_model_quota_reservations"
+    __table_args__ = (
+        UniqueConstraint("turn_id", name="uq_nlp_model_quota_reservations_turn_id"),
+        Index("ix_nlp_model_quota_reservations_user_status", "user_id", "status"),
+        Index("ix_nlp_model_quota_reservations_status_turn", "status", "turn_id"),
+    )
+    id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        UUID, ForeignKey("nlp_model_quota_accounts.user_id", ondelete="RESTRICT"), nullable=False
+    )
+    workspace_id: Mapped[str | None] = mapped_column(UUID)
+    turn_id: Mapped[str] = mapped_column(UUID, nullable=False)
+    model_profile: Mapped[str | None] = mapped_column(String(64))
+    reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    used_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    settled_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    pending_invocations: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False, server_default="0")
+    unknown_usage_events: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="reserved")
+    created_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    finalized_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+
+
+class ModelUsageIntentModel(Base):
+    __tablename__ = "nlp_model_usage_intents"
+    __table_args__ = (Index("ix_nlp_model_usage_intents_reservation", "reservation_id", "status"),)
+    operation_id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    reservation_id: Mapped[str | None] = mapped_column(
+        UUID, ForeignKey("nlp_model_quota_reservations.id", ondelete="RESTRICT")
+    )
+    user_id: Mapped[str] = mapped_column(UUID, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    invocation_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, server_default=func.utc_timestamp(6))
+
+
+class ModelUsageEventModel(Base):
+    __tablename__ = "nlp_model_usage_events"
+    __table_args__ = (
+        Index("ix_nlp_model_usage_events_user_completed", "user_id", "completed_at"),
+        Index("ix_nlp_model_usage_events_turn", "turn_id", "completed_at"),
+    )
+    operation_id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    reservation_id: Mapped[str | None] = mapped_column(
+        UUID, ForeignKey("nlp_model_quota_reservations.id", ondelete="SET NULL")
+    )
+    user_id: Mapped[str] = mapped_column(UUID, nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(UUID)
+    conversation_id: Mapped[str | None] = mapped_column(SESSION_IDENTIFIER)
+    turn_id: Mapped[str | None] = mapped_column(UUID)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    parent_operation_id: Mapped[str | None] = mapped_column(UUID)
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_profile: Mapped[str | None] = mapped_column(String(64))
+    preset: Mapped[str] = mapped_column(String(128), nullable=False)
+    route: Mapped[str | None] = mapped_column(String(128))
+    pricing_key: Mapped[str | None] = mapped_column(String(160))
+    pricing_version: Mapped[str | None] = mapped_column(String(64))
+    charge_units: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
+    attempt: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
+    fallback_index: Mapped[int] = mapped_column(INTEGER(unsigned=True), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    cached_input_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    cache_write_input_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    output_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    reasoning_output_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    total_tokens: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    usage_source: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider_response_id: Mapped[str | None] = mapped_column(String(256))
+    outcome_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    finish_reason: Mapped[str | None] = mapped_column(String(128))
+    error_kind: Mapped[str | None] = mapped_column(String(128))
+    started_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64, collation="ascii_bin"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), server_default=func.utc_timestamp(6), nullable=False
+    )
 
 
 class ConversationMessageModel(Base):
@@ -873,6 +1018,10 @@ class StorageAccountModel(TimestampedModel, Base):
     files_used_bytes: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     core_reserved_bytes: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     files_reserved_bytes: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    files_reserved_items: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
+    file_transfer_notification_version: Mapped[int] = mapped_column(
+        BIGINT(unsigned=True), nullable=False, server_default="0"
+    )
     core_quota_override_bytes: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
     files_quota_override_bytes: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
     max_file_override_bytes: Mapped[int | None] = mapped_column(BIGINT(unsigned=True))
@@ -895,6 +1044,7 @@ class StorageReservationModel(Base):
     )
     bucket: Mapped[str] = mapped_column(String(16), nullable=False)
     amount_bytes: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    amount_items: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False, server_default="0")
     resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
     resource_key: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="reserved")
@@ -950,6 +1100,39 @@ class UserFileModel(TimestampedModel, Base):
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="active")
     deleted_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True, index=True)
+
+
+class FileTransferModel(TimestampedModel, Base):
+    """Durable consent request backed by an immutable staged file snapshot."""
+
+    __tablename__ = "nlp_file_transfers"
+    __table_args__ = (
+        Index("ix_nlp_file_transfers_recipient_status_created", "recipient_user_id", "status", "created_at"),
+        Index("ix_nlp_file_transfers_sender_status_created", "sender_user_id", "status", "created_at"),
+        Index("ix_nlp_file_transfers_cleanup_status_created", "status", "created_at", "id"),
+        Index("ix_nlp_file_transfers_status_expires", "status", "expires_at"),
+        UniqueConstraint("sender_user_id", "idempotency_key", name="uq_nlp_file_transfers_sender_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(UUID, primary_key=True)
+    sender_user_id: Mapped[str] = mapped_column(UUID, ForeignKey("nlp_users.id", ondelete="CASCADE"), nullable=False)
+    recipient_user_id: Mapped[str] = mapped_column(UUID, ForeignKey("nlp_users.id", ondelete="CASCADE"), nullable=False)
+    source_workspace_id: Mapped[str] = mapped_column(UUID, ForeignKey("nlp_workspaces.id", ondelete="RESTRICT"), nullable=False)
+    recipient_workspace_id: Mapped[str] = mapped_column(UUID, ForeignKey("nlp_workspaces.id", ondelete="RESTRICT"), nullable=False)
+    source_file_id: Mapped[str | None] = mapped_column(UUID, ForeignKey("nlp_user_files.id", ondelete="SET NULL"))
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str | None] = mapped_column(String(128))
+    size_bytes: Mapped[int] = mapped_column(BIGINT(unsigned=True), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    staging_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    quota_reservation_id: Mapped[str] = mapped_column(UUID, ForeignKey("nlp_storage_reservations.id", ondelete="RESTRICT"), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
+    recipient_seen_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    responded_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    staging_deleted_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
+    accepted_file_id: Mapped[str | None] = mapped_column(UUID, ForeignKey("nlp_user_files.id", ondelete="SET NULL"))
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class MemoryDocumentModel(TimestampedModel, Base):
@@ -1044,8 +1227,10 @@ class ClassJoinRequestModel(TimestampedModel, Base):
     __tablename__ = "nlp_class_join_requests"
     __table_args__ = (
         Index("ix_nlp_class_join_requests_class_status", "class_id", "status"),
-        # 防重复申请：同一 (班级, 用户, 状态) 只能有一条 pending
-        UniqueConstraint("class_id", "user_id", "status", name="uq_nlp_class_join_requests_cls_usr_sts"),
+        # MySQL has no partial unique index.  ``pending_key`` is populated only
+        # while a request is pending, so historical approved/rejected rows can
+        # coexist while concurrent pending submissions still have one winner.
+        Index("uq_nlp_class_join_requests_pending_key", "pending_key", unique=True),
     )
 
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
@@ -1054,6 +1239,9 @@ class ClassJoinRequestModel(TimestampedModel, Base):
     )
     user_id: Mapped[str] = mapped_column(
         UUID, ForeignKey("nlp_users.id", ondelete="CASCADE"), nullable=False, comment="申请人"
+    )
+    pending_key: Mapped[str | None] = mapped_column(
+        String(73, collation="ascii_bin"), nullable=True, comment="仅 pending 状态使用的并发唯一键"
     )
     student_number: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="学生选填学号")
     status: Mapped[str] = mapped_column(
@@ -1232,7 +1420,7 @@ class AuthCodeModel(Base):
 
     __tablename__ = "nlp_auth_codes"
     __table_args__ = (
-        UniqueConstraint("kind", "subject", name="uq_nlp_auth_codes_kind_subject"),
+        UniqueConstraint("kind", "active_subject", name="uq_nlp_auth_codes_kind_subject"),
         Index("ix_nlp_auth_codes_kind_subject", "kind", "subject"),
         Index("ix_nlp_auth_codes_kind_ip_created", "kind", "client_ip", "created_at"),
     )
@@ -1240,6 +1428,9 @@ class AuthCodeModel(Base):
     id: Mapped[str] = mapped_column(UUID, primary_key=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     subject: Mapped[str] = mapped_column(String(254), nullable=False)
+    active_subject: Mapped[str | None] = mapped_column(
+        String(254), Computed("CASE WHEN kind IN ('sms_history','sms_attempt') THEN NULL ELSE subject END", persisted=True),
+    )
     code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, index=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -14,6 +14,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
@@ -68,7 +69,6 @@ async def _require_classroom_manager(principal: Principal, db: AsyncSession, cla
         Permission.CLASSROOM_MEMBER_MANAGE,
         ResourceRef("classroom", workspace_id=classroom.workspace_id, classroom_id=classroom.id),
     )
-
 
 
 async def _submit_pending_request(
@@ -151,21 +151,32 @@ async def submit_join_request(
     db: DbSession,
     _write: WriteClaims,
 ):
-    """学生提交加入班级申请（pending）。"""
-    authorization_service.require(principal, Permission.LEARNING_PROGRESS_READ_SELF)
+    """Guest/student 提交加入班级申请（pending）。"""
+    authorization_service.require(principal, Permission.CLASSROOM_JOIN_REQUEST_SUBMIT)
     await rbac_service.classroom(db, classroom_id)
-    existing = await service.get_user_pending_request(db, classroom_id, principal.user_id)
-    if existing is not None:
-        raise HTTPException(status_code=409, detail="您已提交过该班级的加入申请，请等待审核")
-    req = await service.submit_join_request(db, classroom_id, principal.user_id, body.student_number)
-    await db.flush()
-    result = await db.execute(
-        select(ClassJoinRequestModel)
-        .where(ClassJoinRequestModel.id == req.id)
-        .options(selectinload(ClassJoinRequestModel.user_), selectinload(ClassJoinRequestModel.cls))
+    req = await _submit_pending_request(
+        db=db,
+        classroom_id=classroom_id,
+        user_id=principal.user_id,
+        student_number=body.student_number,
     )
-    req = result.scalar_one()
-    return _to_response(req)
+    return await _loaded_response(db, req.id)
+
+
+@router.get("/{classroom_id}/join-code")
+async def get_classroom_join_code(
+    classroom_id: str,
+    principal: Principal,
+    db: DbSession,
+):
+    """Teacher/admin view of the classroom's shareable short code."""
+    await _require_classroom_manager(principal, db, classroom_id)
+    classroom = await rbac_service.classroom(db, classroom_id)
+    return {
+        "classroom_id": classroom.id,
+        "classroom_name": classroom.name,
+        "join_code": classroom.join_code,
+    }
 
 
 @router.get("/{classroom_id}/join-requests", response_model=JoinRequestListResponse)
@@ -200,6 +211,8 @@ async def approve_join_request(
         member_role="student",
         status="active",
         actor_user_id=principal.user_id,
+        preserve_active_sessions=True,
+        promote_guest_to_student=True,
     )
     # P0-5：审批动作写入审计事件
     await rbac_service.audit(

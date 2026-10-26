@@ -78,6 +78,9 @@ const stream = vi.hoisted(() => {
 vi.mock("@/platform/realtime/client", () => ({ StudentSocket: stream.StudentSocket }));
 vi.mock("@/platform/http/api", () => ({
   AUTH_EXPIRED_EVENT: "nova:auth-expired",
+  AuthStateChangedError: class extends Error {},
+  getAuthGeneration: () => 0,
+  subscribeAuthChanges: () => () => undefined,
   ensureAuth: vi.fn().mockResolvedValue({}),
   uploadAttachment: stream.uploadAttachment,
   api: {
@@ -111,6 +114,7 @@ vi.mock("@/platform/http/api", () => ({
     }),
     listStorageFiles: vi.fn().mockResolvedValue({ items: [] }),
     listStorageTrash: vi.fn().mockResolvedValue({ items: [] }),
+    getFileTransferSummary: vi.fn().mockResolvedValue({ pending_count: 0, notification_version: 0 }),
     createStorageFolder: vi.fn(),
     uploadStorageFile: vi.fn(),
     renameStorageFile: vi.fn(),

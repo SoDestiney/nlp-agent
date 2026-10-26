@@ -7,8 +7,10 @@ The HTTP application uses leases; a separately deployed Manager owns this class.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import math
 import time
 from uuid import uuid4
 
@@ -25,6 +27,9 @@ from .optimization import AdaptivePoolPolicy, host_capacity_allows_create, refil
 from .runtime_adapters import SandboxRuntimeAdapter
 from .runtime_profile import DEFAULT_SANDBOX_RUNTIME_LIMITS
 from .warm_pool import RuntimeClaim, RuntimeState, reconcile_runtime_ids, runtime_container_name, warm_pool_service
+
+
+SCRATCH_ADMISSION_TIMEOUT_SECONDS = 5.0
 
 
 def _utc_now() -> datetime:
@@ -479,6 +484,12 @@ class WarmPoolManager:
             return None
 
     async def _host_allows_create(self, *, total_count: int, reserved_count: int = 0) -> bool:
+        runtime_memory_mb = getattr(self._docker, "memory_limit_mb", DEFAULT_SANDBOX_RUNTIME_LIMITS.memory_mb)
+        if isinstance(runtime_memory_mb, bool) or not isinstance(runtime_memory_mb, (int, float)) or not math.isfinite(runtime_memory_mb) or runtime_memory_mb <= 0:
+            raise ValueError("sandbox runtime memory budget must be finite and positive")
+        # Rows reserved earlier in this refill have not reached Docker yet;
+        # their memory is not reflected in MemAvailable. Budget all of them.
+        required_new_memory_mb = runtime_memory_mb * (max(0, reserved_count) + 1)
         host_runtime_count = await self._host_runtime_count()
         host_total_max = max(0, int(settings.NLP_AGENT_SANDBOX_HOST_RUNTIME_TOTAL_MAX))
         effective_total_count = total_count
@@ -498,13 +509,13 @@ class WarmPoolManager:
                 total_max=host_total_max if host_runtime_count is not None else settings.NLP_AGENT_SANDBOX_RUNTIME_TOTAL_MAX,
                 available_memory_mb=float(available_memory),
                 memory_reserve_mb=settings.NLP_AGENT_SANDBOX_HOST_MEMORY_RESERVE_MB,
-                runtime_memory_mb=DEFAULT_SANDBOX_RUNTIME_LIMITS.memory_mb,
+                runtime_memory_mb=required_new_memory_mb,
                 disk_free_gb=float(disk_free),
                 disk_reserve_gb=settings.NLP_AGENT_SANDBOX_HOST_DISK_RESERVE_GB,
             )
         if disk_free is not None and float(disk_free) < settings.NLP_AGENT_SANDBOX_HOST_DISK_RESERVE_GB:
             return False
-        if available_memory is not None and float(available_memory) < settings.NLP_AGENT_SANDBOX_HOST_MEMORY_RESERVE_MB + DEFAULT_SANDBOX_RUNTIME_LIMITS.memory_mb:
+        if available_memory is not None and float(available_memory) < settings.NLP_AGENT_SANDBOX_HOST_MEMORY_RESERVE_MB + required_new_memory_mb:
             return False
         total_max = host_total_max if host_runtime_count is not None else settings.NLP_AGENT_SANDBOX_RUNTIME_TOTAL_MAX
         return effective_total_count < total_max
@@ -711,11 +722,30 @@ class WarmPoolManager:
         self._faults.fail_if_configured("docker.scratch")
         self._trace("sandbox.manager.scratch.started", trace_id=trace_id, span_id=span_id)
         try:
-            result = await self._docker.run_scratch(
-                source=source,
-                timeout_seconds=timeout_seconds,
-                output_limit_bytes=output_limit_bytes,
-            )
+            if self._require_host_lock and not settings.NLP_AGENT_SANDBOX_HOST_LOCK_FILE.strip():
+                raise RuntimeError("Sandbox Manager host capacity lock is required for scratch execution")
+            async with AsyncExitStack() as admission:
+                try:
+                    async with asyncio.timeout(SCRATCH_ADMISSION_TIMEOUT_SECONDS):
+                        await admission.enter_async_context(host_budget_lock(settings.NLP_AGENT_SANDBOX_HOST_LOCK_FILE))
+                        await admission.enter_async_context(self._execution_semaphore)
+                except TimeoutError as error:
+                    raise RuntimeError("Sandbox code capacity is busy; retry after running code finishes.") from error
+                async with self._session_factory() as session:
+                    counts = await self._counts(session)
+                if counts.total_count >= settings.NLP_AGENT_SANDBOX_RUNTIME_TOTAL_MAX:
+                    raise RuntimeError("Sandbox runtime capacity is full; release an environment before retrying.")
+                if not await self._host_allows_create(total_count=counts.total_count):
+                    raise RuntimeError("Sandbox host capacity or resource reserve blocks a new runtime.")
+                # Scratch has no runtime row. Keep the shared host reservation
+                # until its --rm process (or cancellation cleanup) has ended.
+                # Reconcile uses the same lock and cannot mistake a running
+                # scratch for an orphan. No user's interactive kernel is reset.
+                result = await self._docker.run_scratch(
+                    source=source,
+                    timeout_seconds=timeout_seconds,
+                    output_limit_bytes=output_limit_bytes,
+                )
         except Exception as error:
             self._trace(
                 "sandbox.manager.scratch.failed",
@@ -773,9 +803,8 @@ class WarmPoolManager:
         await self._docker.interrupt(external_id)
         self._trace("sandbox.manager.interrupt.completed", runtime_id=runtime_id, trace_id=trace_id, span_id=span_id)
 
-    async def reconcile(self) -> ReconcileActions:
-        """Fail DB rows for vanished containers and remove unmanaged-in-DB orphans."""
-        self._faults.fail_if_configured("manager.reconcile")
+    async def _reconcile_containers_locked(self) -> ReconcileActions:
+        """Compare only while no shared-host scratch/provisioning owns the lock."""
         async with self._session_factory() as session:
             rows = list(
                 (await session.scalars(
@@ -810,6 +839,15 @@ class WarmPoolManager:
             except Exception:
                 # It remains labelled and will be discovered again on the next pass.
                 pass
+        return actions
+
+    async def reconcile(self) -> ReconcileActions:
+        """Fail DB rows for vanished containers and remove unmanaged-in-DB orphans."""
+        self._faults.fail_if_configured("manager.reconcile")
+        if self._require_host_lock and not settings.NLP_AGENT_SANDBOX_HOST_LOCK_FILE.strip():
+            raise RuntimeError("Sandbox Manager host capacity lock is required for reconciliation")
+        async with host_budget_lock(settings.NLP_AGENT_SANDBOX_HOST_LOCK_FILE):
+            actions = await self._reconcile_containers_locked()
         await self._retry_draining_runtimes()
         await self._destroy_unleased_assigned_runtimes()
         if (
@@ -870,6 +908,26 @@ class WarmPoolManager:
         span_id: str | None = None,
     ) -> dict[str, object]:
         """Fence a one-time browser command before it ever reaches Docker."""
+        async with self._execution_semaphore:
+            return await self._execute_claimed_admitted(
+                scope, lease_id=lease_id, runtime_id=runtime_id, generation=generation,
+                nonce=nonce, source=source, trace_id=trace_id, span_id=span_id,
+            )
+
+    async def _execute_claimed_admitted(
+        self,
+        scope: SandboxScope,
+        *,
+        lease_id: str,
+        runtime_id: str,
+        generation: int,
+        nonce: str | None,
+        source: str,
+        trace_id: str | None = None,
+        span_id: str | None = None,
+    ) -> dict[str, object]:
+        # Recheck authentication and consume the nonce AFTER queueing. A
+        # logout, restart or role change while waiting must prevent execution.
         self._trace(
             "sandbox.manager.execute.started",
             runtime_id=runtime_id,
@@ -901,16 +959,17 @@ class WarmPoolManager:
                 now=_utc_now(),
             ):
                 raise PermissionError("sandbox authentication lifecycle is no longer active")
-            if runtime.claim_nonce_hash is not None:
-                if nonce is None or not warm_pool_service.validate_nonce(runtime.claim_nonce_hash, nonce):
+            if nonce is not None:
+                if runtime.claim_nonce_hash is None or not warm_pool_service.validate_nonce(runtime.claim_nonce_hash, nonce):
                     raise PermissionError("sandbox command lease, generation, or nonce is invalid")
                 runtime.claim_nonce_hash = None
+            elif runtime.claim_nonce_hash is not None:
+                raise PermissionError("sandbox command lease, generation, or nonce is invalid")
             external_id = runtime.external_runtime_id
         if not external_id:
             raise RuntimeError("claimed runtime has no container id")
         try:
-            async with self._execution_semaphore:
-                result = await self._docker.execute(external_id, source=source)
+            result = await self._docker.execute(external_id, source=source)
             self._trace(
                 "sandbox.manager.execute.completed",
                 runtime_id=runtime_id,

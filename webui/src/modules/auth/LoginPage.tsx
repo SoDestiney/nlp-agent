@@ -3,6 +3,7 @@ import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { RefreshCw } from "lucide-react";
 import { useAuth } from "@/platform/auth/AuthContext";
 import { api } from "@/platform/http/api";
+import { emailCodeNotice } from "@/shared/utils/emailCodeNotice";
 import { ConsentNotice, LegalDocumentModal } from "./LegalConsent";
 import type { LegalDocumentKind } from "./legalDocuments";
 
@@ -14,10 +15,16 @@ function safeReturnPath(value: unknown): string {
 }
 
 export function LoginPage() {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { isAuthenticated, isLoading, authNotice, clearAuthNotice } = useAuth();
   const location = useLocation();
   const [tab, setTab] = useState<Tab>("login");
+  const [registrationNotice, setRegistrationNotice] = useState("");
+  const [routeNoticeDismissed, setRouteNoticeDismissed] = useState(false);
   const from = safeReturnPath((location.state as { from?: unknown } | null)?.from);
+  const routeAuthNotice = (location.state as { authNotice?: unknown } | null)?.authNotice;
+  const visibleAuthNotice = authNotice || (
+    !routeNoticeDismissed && typeof routeAuthNotice === "string" ? routeAuthNotice : ""
+  );
 
   if (!isLoading && isAuthenticated) {
     return <Navigate to={from} replace />;
@@ -33,10 +40,26 @@ export function LoginPage() {
           </p>
         </div>
 
+        {tab === "login" && visibleAuthNotice && (
+          <div className="mb-4 rounded bg-amber-50 p-3 text-sm text-amber-800" role="status">{visibleAuthNotice}</div>
+        )}
+
+        {tab === "login" && registrationNotice && (
+          <div className="mb-4 rounded bg-green-50 p-3 text-sm text-green-700" role="status">{registrationNotice}</div>
+        )}
+
         {tab === "login" ? (
-          <LoginForm returnPath={from} />
+          <LoginForm
+            returnPath={from}
+            onLoginSubmit={() => setRegistrationNotice("")}
+            onLoginSuccess={() => {
+              clearAuthNotice?.();
+              setRouteNoticeDismissed(true);
+              setRegistrationNotice("");
+            }}
+          />
         ) : (
-          <RegisterForm onSuccess={() => setTab("login")} />
+          <RegisterForm onSuccess={() => { setRegistrationNotice("注册成功，请使用邮箱登录"); setTab("login"); }} />
         )}
 
         {/* Tab switcher at bottom */}
@@ -46,7 +69,12 @@ export function LoginPage() {
           </span>
           <button
             type="button"
-            onClick={() => setTab(tab === "login" ? "register" : "login")}
+            onClick={() => {
+              clearAuthNotice?.();
+              setRouteNoticeDismissed(true);
+              setRegistrationNotice("");
+              setTab(tab === "login" ? "register" : "login");
+            }}
             className="text-sm font-medium text-blue-600 hover:text-blue-700"
           >
             {tab === "login" ? "立即注册" : "去登录"}
@@ -61,7 +89,7 @@ export function LoginPage() {
 // LoginForm
 // ---------------------------------------------------------------------------
 
-function LoginForm({ returnPath }: { returnPath: string }) {
+function LoginForm({ returnPath, onLoginSubmit, onLoginSuccess }: { returnPath: string; onLoginSubmit?: () => void; onLoginSuccess?: () => void }) {
   const { login, error, isLoading } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState("");
@@ -77,9 +105,11 @@ function LoginForm({ returnPath }: { returnPath: string }) {
       setConsentError("请先阅读并同意用户协议和隐私政策");
       return;
     }
+    onLoginSubmit?.();
     setSubmitting(true);
     try {
       await login(username, password);
+      onLoginSuccess?.();
       navigate(returnPath, { replace: true });
     } catch {
       // error is set by AuthContext
@@ -150,6 +180,7 @@ function RegisterForm({ onSuccess }: { onSuccess: () => void }) {
   const [emailSending, setEmailSending] = useState(false);
   const [emailCooldown, setEmailCooldown] = useState(0);
   const [emailSent, setEmailSent] = useState(false);
+  const [emailNotice, setEmailNotice] = useState("");
   const [hasAgreed, setHasAgreed] = useState(false);
   const [legalDocument, setLegalDocument] = useState<LegalDocumentKind | null>(null);
   const [consentError, setConsentError] = useState("");
@@ -201,6 +232,7 @@ function RegisterForm({ onSuccess }: { onSuccess: () => void }) {
     setEmail(value);
     setError("");
     setEmailSent(false);
+    setEmailNotice("");
     setEmailCode("");
     setRegCaptchaId("");
     setRegCaptchaImage("");
@@ -218,8 +250,9 @@ function RegisterForm({ onSuccess }: { onSuccess: () => void }) {
     setEmailSending(true);
     setError("");
     try {
-      await api.sendEmailCode(email.trim(), emailCaptchaId, emailCaptchaCode.trim());
-      setEmailCooldown(60);
+      const sent = await api.sendEmailCode(email.trim(), emailCaptchaId, emailCaptchaCode.trim());
+      setEmailCooldown(sent?.resend_after ?? 60);
+      setEmailNotice(emailCodeNotice(sent?.expires_in));
       setEmailSent(true);
       // 保留用户已输入的图片验证码字符串，不在此处清空
       if (!(await loadCaptcha("reg"))) {
@@ -314,6 +347,7 @@ function RegisterForm({ onSuccess }: { onSuccess: () => void }) {
             {emailSending ? "发送中..." : emailCooldown > 0 ? `${emailCooldown}s` : "发送验证码"}
           </button>
         </div>
+        {emailSent && <p className="mt-2 text-xs text-gray-500" role="status">{emailNotice}</p>}
       </div>
 
       <div>

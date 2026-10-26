@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/platform/http/api";
 
-import { FilesPanel } from "./FilesPanel";
+import { FilesPanel, parseUtcTimestamp } from "./FilesPanel";
 
 vi.mock("@/platform/http/api", () => ({
   api: {
@@ -13,10 +13,19 @@ vi.mock("@/platform/http/api", () => ({
     createStorageFolder: vi.fn(),
     uploadStorageFile: vi.fn(),
     renameStorageFile: vi.fn(),
+    readStorageFile: vi.fn(),
     deleteStorageFile: vi.fn(),
     listStorageTrash: vi.fn(),
     restoreStorageFile: vi.fn(),
     permanentlyDeleteStorageFile: vi.fn(),
+    lookupTransferRecipient: vi.fn(),
+    preflightFileTransfer: vi.fn(),
+    createFileTransfer: vi.fn(),
+    listFileTransfers: vi.fn(),
+    getFileTransferSummary: vi.fn(),
+    acceptFileTransfer: vi.fn(),
+    rejectFileTransfer: vi.fn(),
+    cancelFileTransfer: vi.fn(),
   },
   storageFileDownloadUrl: (fileId: string) => `/api/v1/storage/files/${fileId}/download`,
 }));
@@ -43,6 +52,8 @@ describe("FilesPanel", () => {
     vi.mocked(api.getStorageUsage).mockResolvedValue(usage);
     vi.mocked(api.listStorageFiles).mockResolvedValue({ items: [] });
     vi.mocked(api.listStorageTrash).mockResolvedValue({ items: [] });
+    vi.mocked(api.getFileTransferSummary).mockResolvedValue({ pending_count: 0, notification_version: 0 });
+    vi.mocked(api.listFileTransfers).mockResolvedValue({ items: [] });
   });
 
   afterEach(() => {
@@ -75,6 +86,37 @@ describe("FilesPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "回收站" }));
     await waitFor(() => expect(api.listStorageTrash).toHaveBeenCalledWith("workspace-1"));
     expect(screen.getByText("回收站为空")).toBeInTheDocument();
+  });
+
+  it("opens a server file in the same document preview used by learning imports", async () => {
+    vi.mocked(api.listStorageFiles).mockResolvedValue({
+      items: [{ id: "file-1", kind: "file", name: "lesson.md", mime_type: "text/markdown", size_bytes: 18, created_at: "2026-10-10T06:00:00Z", updated_at: "2026-10-10T06:15:00Z" }],
+    });
+    vi.mocked(api.readStorageFile).mockResolvedValue({
+      content: "# 来自我的文件\n\n这是服务器文件内容。",
+      truncated: false,
+      mime_type: "text/markdown",
+      bytes_read: 18,
+    });
+
+    render(<FilesPanel workspaceId="workspace-1" />);
+    const fileButton = await screen.findByRole("button", { name: "查看 lesson.md" });
+    expect(screen.getByText(/修改于/)).toBeInTheDocument();
+    fireEvent.click(fileButton);
+
+    expect(screen.getByRole("tab", { name: "学习文档导入" })).toHaveAttribute("aria-selected", "true");
+    await waitFor(() => expect(api.readStorageFile).toHaveBeenCalledWith("file-1", "workspace-1"));
+    const preview = await screen.findByTestId("markdown-preview");
+    expect(preview).toHaveTextContent("来自我的文件");
+    expect(preview).toHaveTextContent("这是服务器文件内容。");
+
+    fireEvent.click(screen.getByRole("tab", { name: "我的文件" }));
+    fireEvent.click(screen.getByRole("tab", { name: "学习文档导入" }));
+    expect(screen.queryByTestId("markdown-preview")).not.toBeInTheDocument();
+  });
+
+  it("treats legacy storage timestamps without an offset as UTC", () => {
+    expect(parseUtcTimestamp("2026-10-10T06:15:00").toISOString()).toBe("2026-10-10T06:15:00.000Z");
   });
 
 function markdownFile(name = "notes.md", content = "# 学习笔记") {
@@ -136,6 +178,44 @@ function upload(files: File[]) {
       "/api/v1/learning/book/workspace-1/files/book-file-1",
       expect.objectContaining({ credentials: "include" }),
     );
+  });
+
+  it("switches from a stored-file preview to a newer textbook preview request", async () => {
+    vi.mocked(api.listStorageFiles).mockResolvedValue({
+      items: [{ id: "file-1", kind: "file", name: "我的文件.md", mime_type: "text/markdown", size_bytes: 12, created_at: null, updated_at: null }],
+    });
+    vi.mocked(api.readStorageFile).mockResolvedValue({
+      content: "# 我的文件预览",
+      truncated: false,
+      mime_type: "text/markdown",
+      bytes_read: 12,
+    });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, text: async () => "# 新教材预览" });
+    vi.stubGlobal("fetch", fetchMock);
+    const firstRequest = {
+      id: "book-file-1",
+      name: "旧教材.md",
+      url: "/api/v1/learning/book/workspace-1/files/book-file-1",
+      mediaType: "text/markdown",
+      bytes: 12,
+    };
+    const secondRequest = {
+      id: "book-file-2",
+      name: "新教材.md",
+      url: "/api/v1/learning/book/workspace-1/files/book-file-2",
+      mediaType: "text/markdown",
+      bytes: 12,
+    };
+
+    const view = render(<FilesPanel workspaceId="workspace-1" previewRequest={firstRequest} />);
+    fireEvent.click(await screen.findByRole("button", { name: "查看 我的文件.md" }));
+    expect(await screen.findByText("# 我的文件预览")).toBeInTheDocument();
+
+    view.rerender(<FilesPanel workspaceId="workspace-1" previewRequest={secondRequest} />);
+
+    expect(await screen.findByText("# 新教材预览")).toBeInTheDocument();
+    expect(screen.queryByText("# 我的文件预览")).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(secondRequest.url, expect.objectContaining({ credentials: "include" }));
   });
 
   it("keeps only plain-text previews for text files", async () => {
@@ -237,5 +317,44 @@ function upload(files: File[]) {
     expect(within(list).getAllByRole("listitem")).toHaveLength(1);
     expect(within(list).getByRole("button", { name: "预览 notes.md" })).toBeInTheDocument();
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("finds a recipient only after an exact identity ID lookup and sends the selected file", async () => {
+    vi.mocked(api.listStorageFiles).mockResolvedValue({
+      items: [{ id: "file-1", kind: "file", name: "lesson.md", mime_type: "text/markdown", size_bytes: 18, created_at: null, updated_at: null }],
+    });
+    vi.mocked(api.lookupTransferRecipient).mockResolvedValue({ identity_id: "NV7ABC234DEF567", display_name: "小明" });
+    vi.mocked(api.preflightFileTransfer).mockResolvedValue({ can_receive: true, reason: null });
+    vi.mocked(api.createFileTransfer).mockResolvedValue({ id: "transfer-1", status: "pending" });
+
+    render(<FilesPanel workspaceId="workspace-1" />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "发送 lesson.md" }));
+    expect(screen.queryByText("小明")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("接收人身份 ID"), { target: { value: "nv7abc234def567" } });
+    fireEvent.click(screen.getByRole("button", { name: "查询接收人" }));
+
+    await waitFor(() => expect(api.lookupTransferRecipient).toHaveBeenCalledWith("nv7abc234def567"));
+    expect(await screen.findByText("小明")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "确认发送" }));
+
+    await waitFor(() => expect(api.createFileTransfer).toHaveBeenCalledWith(expect.objectContaining({ source_file_id: "file-1", recipient_identity_id: "NV7ABC234DEF567", workspace_id: "workspace-1", idempotency_key: expect.any(String) })));
+  });
+
+  it("lists multiple incoming requests together and lets the recipient accept one", async () => {
+    vi.mocked(api.getFileTransferSummary).mockResolvedValue({ pending_count: 2, notification_version: 2 });
+    vi.mocked(api.listFileTransfers).mockResolvedValue({ items: [
+      { id: "transfer-1", status: "pending", file_name: "a.md", size_bytes: 12, sender: { identity_id: "NV2AAAAAAAAAAAAA", display_name: "甲" } },
+      { id: "transfer-2", status: "pending", file_name: "b.txt", size_bytes: 20, sender: { identity_id: "NV3BBBBBBBBBBBBB", display_name: "乙" } },
+    ] });
+    vi.mocked(api.acceptFileTransfer).mockResolvedValue({ id: "transfer-1", status: "accepted" });
+
+    render(<FilesPanel workspaceId="workspace-1" />);
+    fireEvent.click(await screen.findByRole("button", { name: /消息/ }));
+
+    expect(await screen.findByText(/来自 甲/)).toBeVisible();
+    expect(screen.getByText(/来自 乙/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "同意 a.md" }));
+    await waitFor(() => expect(api.acceptFileTransfer).toHaveBeenCalledWith("transfer-1"));
   });
 });

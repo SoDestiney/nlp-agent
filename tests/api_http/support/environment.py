@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[3]
 MYSQL_IMAGE = "mysql:8.4"
 REDIS_IMAGE = "redis:7.4-alpine"
 TEST_PASSWORD = "ApiHttp-password-123!"
-DIAGNOSTIC_LOG_NAMES = ("web.log", "monitor.log", "worker.log")
+DIAGNOSTIC_LOG_NAMES = ("web.log", "monitor.log", "worker.log", "sandbox-manager.log")
 SENSITIVE_JSON_KEY_PARTS = (
     "authorization",
     "cookie",
@@ -76,6 +76,8 @@ class ManagedHttpEnvironment:
     full_probe_operations: set[tuple[str, str, str]] = field(default_factory=set)
     observed_websocket_routes: set[str] = field(default_factory=set)
     worker_process: subprocess.Popen[str] | None = None
+    worker_module: str = "tests.api_http.support.worker_entrypoint"
+    sandbox_namespace: str | None = None
 
     @property
     def web_base_url(self) -> str:
@@ -90,7 +92,7 @@ class ManagedHttpEnvironment:
         return self.web_base_url
 
     @classmethod
-    def start(cls) -> "ManagedHttpEnvironment":
+    def start(cls, *, real_sandbox_image: str | None = None) -> "ManagedHttpEnvironment":
         _assert_safe_parent_environment()
         _require_docker_daemon()
 
@@ -134,6 +136,8 @@ class ManagedHttpEnvironment:
                 redis_port=redis_port,
                 uploads_root=uploads_root,
             )
+            if real_sandbox_image is not None:
+                environment._configure_real_sandbox(real_sandbox_image, run_id)
             _docker_run_mysql(mysql_container, mysql_port, database)
             _docker_run_redis(redis_container, redis_port)
             _wait_tcp(mysql_port, label="MySQL")
@@ -141,6 +145,8 @@ class ManagedHttpEnvironment:
             _verify_redis(redis_port, redis_db, run_id)
             _run_migrations(environment.env)
             environment.users = _seed_users(environment.env)
+            if real_sandbox_image is not None:
+                environment._start_sandbox_manager()
             environment._start_server(
                 module="tests.api_http.support.web_entrypoint:app",
                 port=web_port,
@@ -165,6 +171,47 @@ class ManagedHttpEnvironment:
         except Exception:
             environment.close()
             raise
+
+    def _configure_real_sandbox(self, image: str, run_id: str) -> None:
+        if os.environ.get("RUN_SANDBOX_DOCKER_MANAGER_INTEGRATION") != "1":
+            raise ApiHttpEnvironmentError("real Sandbox HTTP mode requires the explicit Docker integration gate")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+            raise ApiHttpEnvironmentError("real Sandbox HTTP mode requires an already-built immutable local image ID")
+        if not re.fullmatch(r"[0-9a-f]{12}", run_id):
+            raise ApiHttpEnvironmentError("real Sandbox HTTP mode requires a private run namespace")
+        self.sandbox_namespace = "api-http-" + run_id
+        self.env.update({
+            "NLP_AGENT_API_HTTP_REAL_SANDBOX": "1",
+            "NLP_AGENT_SANDBOX_DOCKER_IMAGE_DIGEST": image,
+            "NLP_AGENT_SANDBOX_RUNTIME_BACKEND": "runsc",
+            "NLP_AGENT_SANDBOX_DOCKER_MEMORY_MB": "512",
+            "NLP_AGENT_SANDBOX_DOCKER_CPUS": "1.0",
+            "NLP_AGENT_SANDBOX_NAMESPACE": self.sandbox_namespace,
+            "NLP_AGENT_SANDBOX_HOST_LOCK_FILE": str(self.log_dir / "sandbox-host.lock"),
+            "NLP_AGENT_SANDBOX_RUNTIME_TOTAL_MAX": "3",
+            "NLP_AGENT_SANDBOX_HOST_RUNTIME_TOTAL_MAX": "3",
+            "NLP_AGENT_SANDBOX_WARM_POOL_READY_TARGET": "1",
+            "NLP_AGENT_SANDBOX_WARM_POOL_READY_MIN": "1",
+            "NLP_AGENT_SANDBOX_WARM_POOL_READY_MAX": "2",
+            "NLP_AGENT_SANDBOX_ADAPTIVE_POOL_ENABLED": "true",
+            "NLP_AGENT_SANDBOX_EXECUTION_CONCURRENCY_MAX": "2",
+            # These are dedicated CI-runner budgets, not live-host tuning.
+            "NLP_AGENT_SANDBOX_HOST_MEMORY_RESERVE_MB": "512",
+            "NLP_AGENT_SANDBOX_HOST_DISK_RESERVE_GB": "1",
+            "NLP_AGENT_SANDBOX_RECONCILE_INTERVAL_S": "5",
+            "NLP_AGENT_SANDBOX_METRICS_SAMPLE_INTERVAL_S": "1",
+            "NLP_AGENT_SANDBOX_FAULT_INJECTION": "",
+        })
+
+    def _start_sandbox_manager(self) -> None:
+        log = (self.log_dir / "sandbox-manager.log").open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "tests.api_http.support.real_sandbox_manager"],
+            cwd=ROOT, env=self.env, stdout=log, stderr=subprocess.STDOUT, text=True,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
+        self.log_handles.append(log)
+        self.processes.append(process)
 
     def _start_server(self, *, module: str, port: int, log_name: str) -> None:
         log_handle = (self.log_dir / log_name).open("w", encoding="utf-8")
@@ -199,7 +246,7 @@ class ManagedHttpEnvironment:
             [
                 sys.executable,
                 "-m",
-                "tests.api_http.support.worker_entrypoint",
+                self.worker_module,
             ],
             cwd=ROOT,
             env=self.env,
@@ -262,6 +309,13 @@ class ManagedHttpEnvironment:
                 process.kill()
                 process.wait(timeout=5)
         self.processes.clear()
+        cleanup_error = None
+        try:
+            self._remove_owned_sandbox_containers()
+        except Exception as error:
+            # A failed identity check must preserve that runtime, but must not
+            # prevent removal of our separate MySQL/Redis test resources.
+            cleanup_error = error
         if os.environ.get("API_HTTP_PRINT_DIAGNOSTICS") == "1":
             print(_redact_diagnostics(self.diagnostics()))
         self._copy_diagnostics()
@@ -278,6 +332,35 @@ class ManagedHttpEnvironment:
             handle.close()
         self.log_handles.clear()
         shutil.rmtree(self.log_dir, ignore_errors=True)
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _remove_owned_sandbox_containers(self) -> None:
+        namespace = self.sandbox_namespace
+        if namespace is None:
+            return
+        if not re.fullmatch(r"api-http-[0-9a-f]{12}", namespace):
+            raise ApiHttpEnvironmentError("refusing cleanup outside this HTTP test namespace")
+        selected = subprocess.run(
+            ["docker", "ps", "--all", "--quiet", "--no-trunc", "--filter",
+             "label=nova.sandbox.namespace=" + namespace],
+            capture_output=True, text=True, check=True, timeout=15,
+        ).stdout.split()
+        for container_id in selected:
+            if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                raise ApiHttpEnvironmentError("invalid Docker container identity in HTTP cleanup")
+            inspected = subprocess.run(["docker", "inspect", container_id], capture_output=True,
+                                       text=True, check=True, timeout=15)
+            row = json.loads(inspected.stdout)[0]
+            labels = row["Config"].get("Labels") or {}
+            if (labels.get("nova.sandbox.namespace") != namespace
+                    or labels.get("nova.sandbox.managed") != namespace
+                    or any(m.get("Type") != "tmpfs" for m in row.get("Mounts", []))):
+                raise ApiHttpEnvironmentError("Sandbox HTTP cleanup identity/mount mismatch")
+        # Validate the entire selection before removing any runtime.
+        for container_id in selected:
+            subprocess.run(["docker", "rm", "--force", container_id], check=True,
+                           capture_output=True, timeout=30)
 
     def _copy_diagnostics(self) -> None:
         destination_value = os.environ.get("API_HTTP_ARTIFACT_DIR", "").strip()
@@ -501,6 +584,7 @@ def _docker_run_mysql(container: str, port: int, database: str) -> None:
             "--env",
             "MYSQL_ROOT_PASSWORD=root_api_http_password",
             MYSQL_IMAGE,
+            "--log-bin-trust-function-creators=ON",
         ]
     )
 
@@ -579,6 +663,10 @@ def _run_migrations(environment: dict[str, str]) -> None:
         if result.returncode == 0:
             return
         last_error = (result.stderr or result.stdout).strip()
+        # MySQL DDL commits before the revision is stamped. Only retry
+        # connection errors; otherwise preserve the first migration failure.
+        if not re.search(r"\((?:2002|2003|2006|2013),", last_error):
+            raise ApiHttpEnvironmentError(f"Alembic migration failed:\n{last_error}")
         time.sleep(2)
     raise ApiHttpEnvironmentError(f"Alembic migration failed after retries:\n{last_error}")
 
@@ -684,6 +772,11 @@ def _safe_child_environment(
             ),
             "NLP_AGENT_REDIS_URL": f"redis://127.0.0.1:{redis_port}/{redis_db}",
             "NLP_AGENT_GATEWAY_TRANSPORT": "redis",
+            "NLP_AGENT_DEPLOYMENT_ENV": "test",
+            "NLP_AGENT_WORKER_CONCURRENCY": "4",
+            "NLP_AGENT_WORKER_SHUTDOWN_GRACE_S": "30",
+            "NLP_AGENT_WORKER_HEARTBEAT_INTERVAL_S": "5",
+            "NLP_AGENT_WORKER_HEARTBEAT_TTL_S": "30",
             "NLP_AGENT_WEB_SECRET": "api-http-test-secret-" + "x" * 48,
             "NLP_AGENT_STATE_FACTORY": "",
             "NLP_AGENT_WEB_HOST": "127.0.0.1",
@@ -703,6 +796,8 @@ def _safe_child_environment(
             "NLP_AGENT_API_HTTP_RUNTIME_OVERRIDES": str(uploads_root.parent / "runtime-overrides.yaml"),
             "NLP_AGENT_API_HTTP_SKILLS_ROOT": str(uploads_root.parent / ".data" / "skills"),
             "NLP_AGENT_API_HTTP_MCP_STUB": "1",
+            "NLP_AGENT_API_HTTP_REAL_SANDBOX": "0",
+            "PYTHONUNBUFFERED": "1",
             "NLP_AGENT_API_HTTP_EMAIL_PROVIDER": "stub",
             # The deterministic stub fails delivery for any address that starts
             # with this prefix, so the gateway-error path can be exercised
