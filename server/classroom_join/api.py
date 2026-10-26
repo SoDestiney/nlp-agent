@@ -16,18 +16,26 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.exc import IntegrityError
 
 from core.rbac import Permission, ResourceRef, authorization_service
 from server.auth.dependencies import Principal, WriteClaims, get_db_session
 from server.classroom_join import service
 from server.classroom_join.schemas import (
     ApproveJoinRequest,
+    JoinRequestByCodeCreate, 
     JoinRequestCreate,
     JoinRequestListResponse,
     JoinRequestResponse,
 )
 from server.infrastructure.mysql.models import ClassJoinRequestModel
 from server.rbac.service import rbac_service
+
+from pydantic import BaseModel
+
+class JoinRequestByCodeCreate(BaseModel):
+    join_code: str
+    student_number: str | None = None
 
 router = APIRouter(prefix="/api/v1/classrooms", tags=["classroom-join-requests"])
 
@@ -61,6 +69,75 @@ async def _require_classroom_manager(principal: Principal, db: AsyncSession, cla
         ResourceRef("classroom", workspace_id=classroom.workspace_id, classroom_id=classroom.id),
     )
 
+
+
+async def _submit_pending_request(
+    *,
+    db: AsyncSession,
+    classroom_id: str,
+    user_id: str,
+    student_number: str | None,
+) -> ClassJoinRequestModel:
+    member = await service.get_active_classroom_membership(db, classroom_id, user_id)
+    if member is not None:
+        raise service.ClassroomMemberExistsError()
+    existing = await service.get_user_pending_request(db, classroom_id, user_id)
+    if existing is not None:
+        raise service.PendingJoinRequestError()
+    try:
+        # The unique constraint remains the final race-safe guard when two
+        # browser tabs submit the same code at the same time.
+        async with db.begin_nested():
+            req = await service.submit_join_request(
+                db, classroom_id, user_id, student_number
+            )
+    except IntegrityError as error:
+        original = str(getattr(error, "orig", error)).casefold()
+        if "pending_key" not in original and "uq_nlp_class_join_requests_pending_key" not in original:
+            raise
+        raise service.PendingJoinRequestError() from error
+    return req
+
+
+async def _loaded_response(db: AsyncSession, request_id: str) -> JoinRequestResponse:
+    result = await db.execute(
+        select(ClassJoinRequestModel)
+        .where(ClassJoinRequestModel.id == request_id)
+        .options(selectinload(ClassJoinRequestModel.user_), selectinload(ClassJoinRequestModel.cls))
+    )
+    return _to_response(result.scalar_one())
+
+
+@router.post(
+    "/join-requests",
+    response_model=JoinRequestResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def submit_join_request_by_code(
+    body: JoinRequestByCodeCreate,
+    principal: Principal,
+    db: DbSession,
+    _write: WriteClaims,
+):
+    """Guest/student join endpoint; UUIDs stay an internal implementation detail."""
+    authorization_service.require(principal, Permission.CLASSROOM_JOIN_REQUEST_SUBMIT)
+    classroom = await service.get_active_classroom_by_join_code(db, body.join_code)
+    if classroom is None:
+        raise service.JoinCodeNotFoundError()
+    req = await _submit_pending_request(
+        db=db,
+        classroom_id=classroom.id,
+        user_id=principal.user_id,
+        student_number=body.student_number,
+    )
+    return await _loaded_response(db, req.id)
+
+@router.get("/my-join-requests", response_model=JoinRequestListResponse)
+async def my_join_requests(principal: Principal, db: DbSession):
+    """当前用户查看自己的全部加入申请。"""
+    authorization_service.require(principal, Permission.CLASSROOM_JOIN_REQUEST_SUBMIT)
+    requests = await service.get_user_join_requests(db, principal.user_id)
+    return JoinRequestListResponse(items=[_to_response(r) for r in requests], total=len(requests))
 
 @router.post(
     "/{classroom_id}/join-requests",
@@ -179,10 +256,3 @@ async def reject_join_request(
     )
     req = result.scalar_one()
     return _to_response(req)
-
-
-@router.get("/my-join-requests", response_model=JoinRequestListResponse)
-async def my_join_requests(principal: Principal, db: DbSession):
-    """当前用户查看自己的全部加入申请。"""
-    requests = await service.get_user_join_requests(db, principal.user_id)
-    return JoinRequestListResponse(items=[_to_response(r) for r in requests], total=len(requests))
