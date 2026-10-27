@@ -45,9 +45,3 @@ class JoinRequestResponse(BaseModel):
 class JoinRequestListResponse(BaseModel):
     items: list[JoinRequestResponse]
     total: int
-
-
-
-class JoinRequestByCodeCreate(BaseModel):
-    join_code: str
-    student_number: str | None = None

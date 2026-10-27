@@ -17,7 +17,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.exc import IntegrityError
 
 from core.rbac import Permission, ResourceRef, authorization_service
 from server.auth.dependencies import Principal, WriteClaims, get_db_session
@@ -33,10 +32,6 @@ from server.infrastructure.mysql.models import ClassJoinRequestModel
 from server.rbac.service import rbac_service
 
 from pydantic import BaseModel
-
-class JoinRequestByCodeCreate(BaseModel):
-    join_code: str
-    student_number: str | None = None
 
 router = APIRouter(prefix="/api/v1/classrooms", tags=["classroom-join-requests"])
 
